@@ -20,7 +20,8 @@ function safeMessage(error) {
 }
 
 function lockHash() {
-  return crypto.createHash("sha256").update(fs.readFileSync(lockPath)).digest("hex");
+  const normalized = fs.readFileSync(lockPath, "utf8").replace(/\r\n?/g, "\n");
+  return crypto.createHash("sha256").update(normalized, "utf8").digest("hex");
 }
 
 function expectedState() {
@@ -123,7 +124,7 @@ function limitedStatus() {
       arch: process.arch,
       supported: ["win32", "linux"].includes(process.platform)
         && process.arch === "x64"
-        && (nodeMajor === 22 || (nodeMajor === 20 && nodeMinor >= 9)),
+        && (nodeMajor === 22 || nodeMajor === 24 || (nodeMajor === 20 && nodeMinor >= 9)),
     },
     bootstrap: bootstrapState,
     subsystems: { credentials: "unavailable", jobs: "unavailable", retrieval: "unavailable" },

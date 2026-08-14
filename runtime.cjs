@@ -15679,13 +15679,13 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.2.1",
+  version: "0.2.2",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
   license: "CC-BY-NC-4.0",
   engines: {
-    node: ">=20.9.0 <21 || >=22.0.0 <23"
+    node: ">=20.9.0 <21 || >=22.0.0 <23 || >=24.0.0 <25"
   },
   scripts: {
     build: "node scripts/build.mjs",
@@ -18988,7 +18988,7 @@ var import_node_path4 = __toESM(require("node:path"), 1);
 var STALE_TEMPORARY_FILE_MS = 10 * 6e4;
 function runtimePlatformSupported(nodeVersion = process.versions.node, platform = process.platform, arch = process.arch) {
   const [nodeMajor = Number.NaN, nodeMinor = Number.NaN] = nodeVersion.split(".").map((part) => Number.parseInt(part, 10));
-  return (platform === "win32" || platform === "linux") && arch === "x64" && (nodeMajor === 22 || nodeMajor === 20 && nodeMinor >= 9);
+  return (platform === "win32" || platform === "linux") && arch === "x64" && (nodeMajor === 22 || nodeMajor === 24 || nodeMajor === 20 && nodeMinor >= 9);
 }
 function check2(id, title, state, message, repairKind) {
   return { id, title, state, message, ...repairKind ? { repairKind } : {} };
@@ -19075,7 +19075,7 @@ var SystemService = class {
         "runtime_platform",
         "Runtime platform",
         status.platform.supported ? "pass" : "warning",
-        status.platform.supported ? `${status.platform.platform}/${status.platform.arch}, Node ${status.platform.node}.` : `${status.platform.platform}/${status.platform.arch}, Node ${status.platform.node}; official support is Windows or Linux x64 on Node 20.9+ or 22.`
+        status.platform.supported ? `${status.platform.platform}/${status.platform.arch}, Node ${status.platform.node}.` : `${status.platform.platform}/${status.platform.arch}, Node ${status.platform.node}; official support is Windows or Linux x64 on Node 20.9+, 22, or 24.`
       ),
       check2(
         "data_directory",
