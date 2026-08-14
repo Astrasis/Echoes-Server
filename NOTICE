@@ -1,0 +1,12 @@
+Echoes Memory System
+Copyright (c) 2026 Eternalt
+
+Licensed under Creative Commons Attribution-NonCommercial 4.0 International.
+
+Echoes was independently restructured from ideas and behavior studied in the
+Anima Memory System open-source SillyTavern extension by Ellina, distributed
+under CC BY-NC 4.0. Echoes does not bundle, modify, publish, or migrate Anima's
+source tree or runtime data. The local Anima directory, when present, is a
+development reference and is excluded from Git and release artifacts.
+
+This notice does not imply endorsement by the original author.

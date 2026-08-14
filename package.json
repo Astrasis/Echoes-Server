@@ -1,0 +1,18 @@
+{
+  "name": "echoes-memory-server",
+  "version": "0.2.1",
+  "private": true,
+  "main": "index.js",
+  "license": "CC-BY-NC-4.0",
+  "engines": {
+    "node": ">=20.9.0 <21 || >=22.0.0 <23"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "0.31.0",
+    "ipaddr.js": "2.2.0"
+  },
+  "overrides": {
+    "sharp": "0.35.3",
+    "tar": "7.5.22"
+  }
+}
