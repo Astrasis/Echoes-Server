@@ -15679,7 +15679,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.2.3",
+  version: "0.2.4",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -19269,16 +19269,17 @@ var UserRuntimeRegistry = class {
     const user = requestUser(request);
     const handle = user?.profile?.handle;
     const rootDirectory = user?.directories?.root;
-    if (!handle || !rootDirectory || !import_node_path5.default.isAbsolute(rootDirectory)) {
+    if (!handle || !rootDirectory) {
       throw Object.assign(new Error("Authenticated SillyTavern user context is required."), {
         statusCode: 403,
         code: "USER_CONTEXT_REQUIRED"
       });
     }
-    const key = `${handle}:${import_node_path5.default.resolve(rootDirectory)}`;
+    const resolvedRootDirectory = import_node_path5.default.resolve(rootDirectory);
+    const key = `${handle}:${resolvedRootDirectory}`;
     let runtime = this.runtimes.get(key);
     if (!runtime) {
-      runtime = this.createRuntime(handle, import_node_path5.default.resolve(rootDirectory));
+      runtime = this.createRuntime(handle, resolvedRootDirectory);
       this.runtimes.set(key, runtime);
       runtime.catch(() => this.runtimes.delete(key));
     }

@@ -2,10 +2,10 @@
   "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:32de687a-4910-492a-a1ac-f6ec5bf712bf",
+  "serialNumber": "urn:uuid:496de33d-bad7-455c-be6d-ab9d650a87d4",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-08-15T15:33:56.382Z",
+    "timestamp": "2026-08-15T23:04:53.983Z",
     "lifecycles": [
       {
         "phase": "pre-build"
@@ -19,12 +19,12 @@
       }
     ],
     "component": {
-      "bom-ref": "echoes-memory-server@0.2.3",
+      "bom-ref": "echoes-memory-server@0.2.4",
       "type": "application",
       "name": "server",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "scope": "required",
-      "purl": "pkg:npm/echoes-memory-server@0.2.3",
+      "purl": "pkg:npm/echoes-memory-server@0.2.4",
       "properties": [
         {
           "name": "cdx:npm:package:private",
@@ -3852,7 +3852,7 @@
   ],
   "dependencies": [
     {
-      "ref": "echoes-memory-server@0.2.3",
+      "ref": "echoes-memory-server@0.2.4",
       "dependsOn": [
         "@lancedb/lancedb@0.31.0",
         "ipaddr.js@2.2.0"
