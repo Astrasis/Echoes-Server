@@ -17985,6 +17985,21 @@ function publicMetadata(value) {
 function credentialId() {
   return `credential_${(0, import_node_crypto5.randomUUID)().replaceAll("-", "")}`;
 }
+var nodeCredentialWriter = {
+  writeFile: import_promises4.writeFile,
+  rename: import_promises4.rename,
+  unlink: import_promises4.unlink
+};
+async function writeCredentialFileAtomically(filePath, contents, writer = nodeCredentialWriter) {
+  const temporary = `${filePath}.${process.pid}.${(0, import_node_crypto5.randomUUID)()}.tmp`;
+  try {
+    await writer.writeFile(temporary, contents, { encoding: "utf8", mode: 384 });
+    await writer.rename(temporary, filePath);
+  } catch (error51) {
+    await writer.unlink(temporary).catch(() => void 0);
+    throw error51;
+  }
+}
 var CredentialStore = class {
   constructor(dataDirectory) {
     this.dataDirectory = dataDirectory;
@@ -18125,9 +18140,7 @@ var CredentialStore = class {
   }
   async write(file2) {
     await (0, import_promises4.mkdir)(this.dataDirectory, { recursive: true });
-    const temporary = `${this.filePath}.${process.pid}.${(0, import_node_crypto5.randomUUID)()}.tmp`;
-    await (0, import_promises4.writeFile)(temporary, JSON.stringify(file2, null, 2), { encoding: "utf8", mode: 384 });
-    await (0, import_promises4.rename)(temporary, this.filePath);
+    await writeCredentialFileAtomically(this.filePath, JSON.stringify(file2, null, 2));
     if (process.platform !== "win32") await (0, import_promises4.chmod)(this.filePath, 384);
   }
   serialize(operation) {
