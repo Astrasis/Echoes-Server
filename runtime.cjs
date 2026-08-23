@@ -15679,7 +15679,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.3",
+  version: "0.3.4",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -18001,13 +18001,19 @@ async function writeCredentialFileAtomically(filePath, contents, writer = nodeCr
   }
 }
 var CredentialStore = class {
-  constructor(dataDirectory) {
+  constructor(dataDirectory, usageFlushDelayMs = 3e4) {
     this.dataDirectory = dataDirectory;
+    this.usageFlushDelayMs = usageFlushDelayMs;
     this.filePath = import_node_path3.default.join(dataDirectory, "credentials.json");
   }
   dataDirectory;
+  usageFlushDelayMs;
   filePath;
   writeChain = Promise.resolve();
+  cache = null;
+  loadPromise = null;
+  pendingLastUsedAt = /* @__PURE__ */ new Map();
+  usageFlushTimer = null;
   async list() {
     return (await this.read()).credentials.map(publicMetadata);
   }
@@ -18086,18 +18092,31 @@ var CredentialStore = class {
   }
   async resolve(endpoint) {
     if (!endpoint.credentialId) return structuredClone(endpoint);
-    return this.serialize(async () => {
-      const file2 = await this.read();
-      const credential = file2.credentials.find((item) => item.id === endpoint.credentialId);
-      if (!credential) {
-        throw Object.assign(new Error(`Credential is unavailable: ${endpoint.credentialId}`), {
-          statusCode: 409,
-          code: "CREDENTIAL_UNAVAILABLE"
-        });
-      }
-      credential.lastUsedAt = (/* @__PURE__ */ new Date()).toISOString();
-      await this.write(file2);
-      return { ...structuredClone(endpoint), apiKey: credential.secret };
+    const file2 = await this.read();
+    const credential = file2.credentials.find((item) => item.id === endpoint.credentialId);
+    if (!credential) {
+      throw Object.assign(new Error(`Credential is unavailable: ${endpoint.credentialId}`), {
+        statusCode: 409,
+        code: "CREDENTIAL_UNAVAILABLE"
+      });
+    }
+    const lastUsedAt = (/* @__PURE__ */ new Date()).toISOString();
+    credential.lastUsedAt = lastUsedAt;
+    const cached2 = this.cache?.credentials.find((item) => item.id === credential.id);
+    if (cached2) cached2.lastUsedAt = lastUsedAt;
+    this.pendingLastUsedAt.set(credential.id, lastUsedAt);
+    this.scheduleUsageFlush();
+    return { ...structuredClone(endpoint), apiKey: credential.secret };
+  }
+  async flushUsage() {
+    if (this.usageFlushTimer) {
+      clearTimeout(this.usageFlushTimer);
+      this.usageFlushTimer = null;
+    }
+    if (this.pendingLastUsedAt.size === 0) return;
+    await this.serialize(async () => {
+      if (this.pendingLastUsedAt.size === 0) return;
+      await this.write(await this.read());
     });
   }
   async permissions() {
@@ -18117,6 +18136,16 @@ var CredentialStore = class {
     return true;
   }
   async read() {
+    if (this.cache) return structuredClone(this.cache);
+    this.loadPromise ??= this.readFromDisk().then((file2) => {
+      this.cache = structuredClone(file2);
+      return file2;
+    }).finally(() => {
+      this.loadPromise = null;
+    });
+    return structuredClone(await this.loadPromise);
+  }
+  async readFromDisk() {
     try {
       const parsed = JSON.parse(await (0, import_promises4.readFile)(this.filePath, "utf8"));
       if (parsed.formatVersion !== 1 || !Array.isArray(parsed.credentials)) {
@@ -18134,14 +18163,38 @@ var CredentialStore = class {
         })
       };
     } catch (error51) {
-      if (error51.code === "ENOENT") return { formatVersion: 1, credentials: [] };
+      if (error51.code === "ENOENT") {
+        return { formatVersion: 1, credentials: [] };
+      }
       throw error51;
     }
   }
   async write(file2) {
+    const usageSnapshot = new Map(this.pendingLastUsedAt);
+    for (const credential of file2.credentials) {
+      const lastUsedAt = usageSnapshot.get(credential.id);
+      if (lastUsedAt) credential.lastUsedAt = lastUsedAt;
+    }
     await (0, import_promises4.mkdir)(this.dataDirectory, { recursive: true });
     await writeCredentialFileAtomically(this.filePath, JSON.stringify(file2, null, 2));
     if (process.platform !== "win32") await (0, import_promises4.chmod)(this.filePath, 384);
+    for (const [id, lastUsedAt] of usageSnapshot) {
+      if (this.pendingLastUsedAt.get(id) === lastUsedAt) this.pendingLastUsedAt.delete(id);
+    }
+    this.cache = structuredClone(file2);
+    for (const [id, lastUsedAt] of this.pendingLastUsedAt) {
+      const credential = this.cache.credentials.find((item) => item.id === id);
+      if (credential) credential.lastUsedAt = lastUsedAt;
+      else this.pendingLastUsedAt.delete(id);
+    }
+  }
+  scheduleUsageFlush() {
+    if (this.usageFlushTimer || this.pendingLastUsedAt.size === 0) return;
+    this.usageFlushTimer = setTimeout(() => {
+      this.usageFlushTimer = null;
+      void this.flushUsage().catch(() => void 0);
+    }, Math.max(0, this.usageFlushDelayMs));
+    this.usageFlushTimer.unref?.();
   }
   serialize(operation) {
     const result = this.writeChain.then(operation, operation);
