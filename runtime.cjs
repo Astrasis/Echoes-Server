@@ -15455,6 +15455,12 @@ var endpointTestRequestSchema = external_exports.discriminatedUnion("kind", [
     endpoint: retrievalEndpointSchema
   })
 ]);
+var endpointModelListRequestSchema = external_exports.object({
+  baseUrl: external_exports.string().url().max(2e3),
+  credentialId: identifierSchema.optional(),
+  apiKey: external_exports.string().max(2e4).optional(),
+  timeoutMs: external_exports.number().int().min(1e3).max(30 * 6e4).default(3e4)
+}).strict();
 var buildInfoSchema = external_exports.object({
   appVersion: external_exports.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/),
   apiProtocolVersion: external_exports.number().int().positive(),
@@ -15679,7 +15685,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.4",
+  version: "0.3.5",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -15977,6 +15983,22 @@ function registerRoutes(options) {
         (context) => retrieval(runtime).continueQuery(input, context),
         {
           dedupeKey: retrievalFingerprint("query-continuation", input),
+          lane: "interactive"
+        }
+      );
+      response.status(202).json({ job });
+    })
+  );
+  router.post(
+    "/retrieval/endpoints/models",
+    route(async (request, response) => {
+      const runtime = await runtimes2.forRequest(request);
+      const input = endpointModelListRequestSchema.parse(request.body);
+      const job = await runtime.jobs.create(
+        "endpoint-model-list",
+        (context) => runtime.generationService.listModels(input, context),
+        {
+          dedupeKey: retrievalFingerprint("endpoint-model-list", input),
           lane: "interactive"
         }
       );
@@ -18268,6 +18290,60 @@ function completionUrl(baseUrl) {
   if (/\/v1$/i.test(normalized)) return `${normalized}/chat/completions`;
   return `${normalized}/v1/chat/completions`;
 }
+function modelsUrl(baseUrl) {
+  const url2 = new URL(baseUrl);
+  let pathname = url2.pathname.replace(/\/+$/, "");
+  pathname = pathname.replace(/\/(?:chat\/completions|embeddings|rerank)$/i, "");
+  if (!/\/v\d+$/i.test(pathname)) pathname = `${pathname}/v1`;
+  url2.pathname = `${pathname}/models`.replace(/\/{2,}/g, "/");
+  url2.search = "";
+  url2.hash = "";
+  return url2.toString();
+}
+function parseModelCatalog(payload) {
+  const source = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : [];
+  const models = source.flatMap((item) => {
+    if (typeof item === "string") return [item.trim()];
+    if (!item || typeof item !== "object") return [];
+    const record2 = item;
+    const value = record2.id ?? record2.name ?? record2.model;
+    return typeof value === "string" ? [value.trim()] : [];
+  }).filter((model) => model.length > 0 && model.length <= 200);
+  const unique = [...new Set(models)].sort((left, right) => left.localeCompare(right));
+  if (unique.length === 0) throw new Error("Provider returned no usable model IDs.");
+  if (unique.length > 1e4) throw new Error("Provider returned too many models.");
+  return unique;
+}
+async function requestModelCatalog(options) {
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(() => timeoutController.abort(), options.config.timeoutMs);
+  const combined = combineAbortSignals([options.signal, timeoutController.signal]);
+  try {
+    const response = await requestProvider(modelsUrl(options.config.baseUrl), {
+      method: "GET",
+      signal: combined.signal,
+      headers: {
+        Accept: "application/json",
+        ...options.config.apiKey ? { Authorization: `Bearer ${options.config.apiKey}` } : {}
+      }
+    });
+    const raw = await readResponseTextLimited(response, 4 * 1024 * 1024);
+    if (!response.ok) throw new ProviderCallError(`Provider model list returned HTTP ${response.status}.`, response.status, false);
+    try {
+      return parseModelCatalog(JSON.parse(raw));
+    } catch (error51) {
+      if (error51 instanceof ProviderCallError) throw error51;
+      throw new ProviderCallError(`Provider returned an invalid model list: ${error51 instanceof Error ? error51.message : String(error51)}`, 200, false);
+    }
+  } catch (error51) {
+    if (options.signal.aborted) throw options.signal.reason ?? error51;
+    if (timeoutController.signal.aborted) throw new Error(`Provider model list timed out after ${options.config.timeoutMs}ms.`);
+    throw error51;
+  } finally {
+    clearTimeout(timeout);
+    combined.dispose();
+  }
+}
 function extractContent(payload) {
   const choice = payload.choices?.[0];
   return choice?.delta?.content ?? choice?.message?.content ?? "";
@@ -18466,6 +18542,25 @@ var GenerationService = class {
         )
       })
     });
+  }
+  async listModels(input, context) {
+    const endpoint = {
+      id: "model_catalog",
+      name: "Model catalog",
+      baseUrl: input.baseUrl,
+      ...input.credentialId ? { credentialId: input.credentialId } : {},
+      ...input.apiKey ? { apiKey: input.apiKey } : {},
+      model: "model-catalog",
+      timeoutMs: input.timeoutMs,
+      enabled: true,
+      order: 0
+    };
+    const runtimeEndpoint = await this.resolveEndpoint(endpoint);
+    const startedAt = Date.now();
+    context.report(0.2, "Requesting provider model catalog");
+    const models = await requestModelCatalog({ config: runtimeEndpoint, signal: context.signal });
+    context.report(1, `Loaded ${models.length} models`);
+    return { models, latencyMs: Date.now() - startedAt };
   }
   async testEndpoint(endpoint, context) {
     const startedAt = Date.now();
