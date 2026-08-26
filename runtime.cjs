@@ -15685,7 +15685,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.5",
+  version: "0.3.6",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
