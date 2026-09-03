@@ -1,6 +1,6 @@
 {
   "name": "echoes-memory-server",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "private": true,
   "main": "index.js",
   "license": "CC-BY-NC-4.0",
