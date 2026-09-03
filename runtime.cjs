@@ -14821,6 +14821,7 @@ var generationEndpointSchema = external_exports.object({
   id: identifierSchema,
   name: external_exports.string().trim().min(1).max(120),
   baseUrl: external_exports.string().url().max(2e3),
+  allowPrivateNetwork: external_exports.boolean().default(false),
   credentialId: identifierSchema.optional(),
   apiKey: external_exports.string().max(2e4).optional(),
   model: external_exports.string().trim().min(1).max(200),
@@ -15198,6 +15199,7 @@ var retrievalEndpointSchema = external_exports.object({
   id: identifierSchema,
   name: external_exports.string().trim().min(1).max(120),
   baseUrl: external_exports.string().url().max(2e3),
+  allowPrivateNetwork: external_exports.boolean().default(false),
   credentialId: identifierSchema.optional(),
   apiKey: external_exports.string().max(2e4).optional(),
   model: external_exports.string().trim().min(1).max(200),
@@ -15457,6 +15459,7 @@ var endpointTestRequestSchema = external_exports.discriminatedUnion("kind", [
 ]);
 var endpointModelListRequestSchema = external_exports.object({
   baseUrl: external_exports.string().url().max(2e3),
+  allowPrivateNetwork: external_exports.boolean().default(false),
   credentialId: identifierSchema.optional(),
   apiKey: external_exports.string().max(2e4).optional(),
   timeoutMs: external_exports.number().int().min(1e3).max(30 * 6e4).default(3e4)
@@ -15685,7 +15688,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.6",
+  version: "0.3.7",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -16687,25 +16690,41 @@ function configuredAllowedHosts() {
     (process.env.ECHOES_ALLOWED_API_HOSTS ?? "").split(",").map((host) => normalizeHostname(host.trim())).filter(Boolean)
   );
 }
+var ProviderUrlPolicyError = class extends Error {
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+    this.name = "ProviderUrlPolicyError";
+  }
+  code;
+};
 async function resolveProviderTarget(rawUrl, options = {}) {
   const url2 = new URL(rawUrl);
   if (!["http:", "https:"].includes(url2.protocol)) {
-    throw new Error("Secondary API URL must use HTTP or HTTPS.");
+    throw new ProviderUrlPolicyError(
+      "Secondary API URL must use HTTP or HTTPS.",
+      "PROVIDER_URL_PROTOCOL_INVALID"
+    );
   }
   if (url2.username || url2.password) {
-    throw new Error("Secondary API URL must not contain embedded credentials.");
+    throw new ProviderUrlPolicyError(
+      "Secondary API URL must not contain embedded credentials.",
+      "PROVIDER_URL_EMBEDDED_CREDENTIALS"
+    );
   }
   const hostname3 = normalizeHostname(url2.hostname);
   const allowedHosts = options.allowedHosts ?? configuredAllowedHosts();
-  const trusted = allowedHosts.has(hostname3);
+  const trusted = allowedHosts.has(hostname3) || options.allowPrivateNetwork === true;
   if (!trusted && url2.protocol !== "https:") {
-    throw new Error(
-      "Non-HTTPS secondary API hosts must be explicitly listed in ECHOES_ALLOWED_API_HOSTS."
+    throw new ProviderUrlPolicyError(
+      "Non-HTTPS secondary API hosts must be explicitly listed in ECHOES_ALLOWED_API_HOSTS.",
+      "PROVIDER_URL_HTTP_NOT_TRUSTED"
     );
   }
   if (!trusted && (hostname3 === "localhost" || hostname3.endsWith(".localhost") || hostname3.endsWith(".local") || hostname3.endsWith(".internal") || hostname3.endsWith(".home.arpa") || (0, import_node_net.isIP)(hostname3) !== 0 && isPrivateOrReservedAddress(hostname3))) {
-    throw new Error(
-      "Secondary API resolves to a private or reserved address. Add the exact host to ECHOES_ALLOWED_API_HOSTS only if it is trusted."
+    throw new ProviderUrlPolicyError(
+      "Secondary API resolves to a private or reserved address. Enable private-network access for this endpoint only if the host is trusted.",
+      "PROVIDER_URL_PRIVATE_NOT_TRUSTED"
     );
   }
   const resolve = options.resolve ?? (async (host) => {
@@ -16714,7 +16733,10 @@ async function resolveProviderTarget(rawUrl, options = {}) {
   });
   const addresses = (0, import_node_net.isIP)(hostname3) === 0 ? await resolve(hostname3) : [hostname3];
   if (addresses.length === 0 || !trusted && addresses.some(isPrivateOrReservedAddress)) {
-    throw new Error("Secondary API host resolved to a private, reserved, or empty address set.");
+    throw new ProviderUrlPolicyError(
+      "Secondary API host resolved to a private, reserved, or empty address set. Enable private-network access for this endpoint only if the host is trusted.",
+      "PROVIDER_URL_PRIVATE_NOT_TRUSTED"
+    );
   }
   return {
     url: url2,
@@ -16861,6 +16883,8 @@ async function providerJson(options) {
         ...options.endpoint.apiKey ? { Authorization: `Bearer ${options.endpoint.apiKey}` } : {}
       },
       body: JSON.stringify(options.body)
+    }, {
+      allowPrivateNetwork: options.endpoint.allowPrivateNetwork === true
     });
     const text = await readResponseTextLimited(
       response,
@@ -16879,6 +16903,12 @@ async function providerJson(options) {
   } catch (error51) {
     if (options.signal.aborted) throw options.signal.reason ?? error51;
     if (error51 instanceof RetrievalProviderError) throw error51;
+    if (error51 instanceof ProviderUrlPolicyError) {
+      throw new RetrievalProviderError(error51.message, {
+        ambiguous: false,
+        code: error51.code
+      });
+    }
     if (timeoutController.signal.aborted) {
       throw new RetrievalProviderError(
         `Provider timed out after ${options.endpoint.timeoutMs}ms. The request may still have completed and been billed.`,
@@ -18326,6 +18356,8 @@ async function requestModelCatalog(options) {
         Accept: "application/json",
         ...options.config.apiKey ? { Authorization: `Bearer ${options.config.apiKey}` } : {}
       }
+    }, {
+      allowPrivateNetwork: options.config.allowPrivateNetwork === true
     });
     const raw = await readResponseTextLimited(response, 4 * 1024 * 1024);
     if (!response.ok) throw new ProviderCallError(`Provider model list returned HTTP ${response.status}.`, response.status, false);
@@ -18400,6 +18432,8 @@ async function requestStructuredCompletion(options) {
       headers,
       body: JSON.stringify(body),
       signal: combined.signal
+    }, {
+      allowPrivateNetwork: config2.allowPrivateNetwork === true
     });
     if (!response.ok) {
       await readResponseTextLimited(response, 64 * 1024);
@@ -18468,6 +18502,12 @@ async function requestStructuredCompletion(options) {
   } catch (error51) {
     if (signal.aborted) throw signal.reason ?? error51;
     if (error51 instanceof RetrievalProviderError) throw error51;
+    if (error51 instanceof ProviderUrlPolicyError) {
+      throw new RetrievalProviderError(error51.message, {
+        ambiguous: false,
+        code: error51.code
+      });
+    }
     if (timeoutController.signal.aborted) {
       throw new RetrievalProviderError(
         `Provider timed out after ${config2.timeoutMs}ms. The request may still have completed and been billed.`,
@@ -18548,6 +18588,7 @@ var GenerationService = class {
       id: "model_catalog",
       name: "Model catalog",
       baseUrl: input.baseUrl,
+      allowPrivateNetwork: input.allowPrivateNetwork === true,
       ...input.credentialId ? { credentialId: input.credentialId } : {},
       ...input.apiKey ? { apiKey: input.apiKey } : {},
       model: "model-catalog",
