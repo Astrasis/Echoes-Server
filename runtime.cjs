@@ -15450,7 +15450,7 @@ var endpointTestRequestSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({
     kind: external_exports.literal("embedding"),
     endpoint: retrievalEndpointSchema,
-    expectedDimensions: external_exports.number().int().min(1).max(65536)
+    expectedDimensions: external_exports.number().int().min(1).max(65536).optional()
   }),
   external_exports.object({
     kind: external_exports.literal("rerank"),
@@ -15688,7 +15688,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.9",
+  version: "0.3.10",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -16939,12 +16939,13 @@ async function providerJson(options) {
   }
 }
 async function requestEmbeddings(options) {
-  const estimatedResponseBytes = options.texts.length * options.expectedDimensions * 24 + 1024 * 1024;
+  const estimatedDimensions = options.expectedDimensions ?? 1536;
+  const estimatedResponseBytes = options.texts.length * estimatedDimensions * 24 + 1024 * 1024;
   const response = await providerJson({
     endpoint: options.endpoint,
     url: embeddingUrl(options.endpoint.baseUrl),
     signal: options.signal,
-    body: { model: options.endpoint.model, input: options.texts },
+    body: { model: options.endpoint.model, input: options.texts, encoding_format: "float" },
     maxResponseBytes: Math.min(
       MAX_EMBEDDING_RESPONSE_BYTES,
       Math.max(16 * 1024 * 1024, estimatedResponseBytes)
@@ -16960,8 +16961,16 @@ async function requestEmbeddings(options) {
       throw new Error("Embedding response indices are missing or duplicated.");
     }
     return ordered.map((item, index) => {
-      if (!Array.isArray(item.embedding) || item.embedding.length !== options.expectedDimensions || item.embedding.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
-        throw new Error(`Embedding ${index} does not match the configured ${options.expectedDimensions} dimensions.`);
+      if (!Array.isArray(item.embedding) || item.embedding.length === 0) {
+        throw new Error(`Embedding ${index} is not a non-empty numeric array.`);
+      }
+      if (item.embedding.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+        throw new Error(`Embedding ${index} contains a non-finite numeric value.`);
+      }
+      if (options.expectedDimensions !== void 0 && item.embedding.length !== options.expectedDimensions) {
+        throw new Error(
+          `Embedding ${index} returned ${item.embedding.length} dimensions; the endpoint group is configured for ${options.expectedDimensions}.`
+        );
       }
       return item.embedding;
     });
@@ -17431,7 +17440,6 @@ var RetrievalService = class {
           return (await requestEmbeddings({
             endpoint,
             texts: ["Echoes endpoint health check"],
-            expectedDimensions: options.expectedDimensions,
             signal: context.signal
           }))[0];
         }
