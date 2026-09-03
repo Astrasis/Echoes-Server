@@ -15212,6 +15212,7 @@ var embeddingEndpointGroupSchema = external_exports.object({
   name: external_exports.string().trim().min(1).max(120),
   embeddingSpaceId: identifierSchema,
   dimensions: external_exports.number().int().min(1).max(65536),
+  requestDimensions: external_exports.boolean().default(true),
   endpoints: external_exports.array(retrievalEndpointSchema).min(1).max(10)
 }).superRefine((group, context) => validateEndpointOrder(group.endpoints, context));
 var rerankEndpointSetSchema = external_exports.object({
@@ -15450,6 +15451,8 @@ var endpointTestRequestSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({
     kind: external_exports.literal("embedding"),
     endpoint: retrievalEndpointSchema,
+    requestedDimensions: external_exports.number().int().min(1).max(65536).optional(),
+    /** @deprecated Accepted for compatibility with the 0.3.10 client. */
     expectedDimensions: external_exports.number().int().min(1).max(65536).optional()
   }),
   external_exports.object({
@@ -15688,7 +15691,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.10",
+  version: "0.3.11",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -16939,13 +16942,18 @@ async function providerJson(options) {
   }
 }
 async function requestEmbeddings(options) {
-  const estimatedDimensions = options.expectedDimensions ?? 1536;
+  const estimatedDimensions = options.expectedDimensions ?? options.requestedDimensions ?? 1536;
   const estimatedResponseBytes = options.texts.length * estimatedDimensions * 24 + 1024 * 1024;
   const response = await providerJson({
     endpoint: options.endpoint,
     url: embeddingUrl(options.endpoint.baseUrl),
     signal: options.signal,
-    body: { model: options.endpoint.model, input: options.texts, encoding_format: "float" },
+    body: {
+      model: options.endpoint.model,
+      input: options.texts,
+      encoding_format: "float",
+      ...options.requestedDimensions !== void 0 ? { dimensions: options.requestedDimensions } : {}
+    },
     maxResponseBytes: Math.min(
       MAX_EMBEDDING_RESPONSE_BYTES,
       Math.max(16 * 1024 * 1024, estimatedResponseBytes)
@@ -17114,6 +17122,7 @@ var RetrievalService = class {
         endpoint,
         texts: prepared.needsEmbedding.map((document) => document.text),
         expectedDimensions: request.embeddingGroup.dimensions,
+        requestedDimensions: request.embeddingGroup.requestDimensions === false ? void 0 : request.embeddingGroup.dimensions,
         signal: context.signal
       })
     });
@@ -17174,6 +17183,7 @@ var RetrievalService = class {
           endpoint,
           texts: documents.map((document) => document.text),
           expectedDimensions: options.embeddingGroup.dimensions,
+          requestedDimensions: options.embeddingGroup.requestDimensions === false ? void 0 : options.embeddingGroup.dimensions,
           signal: context.signal
         })
       });
@@ -17383,7 +17393,8 @@ var RetrievalService = class {
       name: group.name,
       ..."embeddingSpaceId" in group ? {
         embeddingSpaceId: group.embeddingSpaceId,
-        dimensions: group.dimensions
+        dimensions: group.dimensions,
+        requestDimensions: group.requestDimensions !== false
       } : {},
       endpoints: group.endpoints.map(({ apiKey: _apiKey, ...endpoint }) => endpoint)
     });
@@ -17440,6 +17451,7 @@ var RetrievalService = class {
           return (await requestEmbeddings({
             endpoint,
             texts: ["Echoes endpoint health check"],
+            requestedDimensions: options.requestedDimensions,
             signal: context.signal
           }))[0];
         }
@@ -17497,6 +17509,7 @@ var RetrievalService = class {
         endpoint,
         texts: [request.query],
         expectedDimensions: group.dimensions,
+        requestedDimensions: group.requestDimensions === false ? void 0 : group.dimensions,
         signal: context.signal
       }))[0]
     });
