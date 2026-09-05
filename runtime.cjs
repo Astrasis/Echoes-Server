@@ -14573,6 +14573,7 @@ var FAILOVER_POLICIES = [
 var VECTOR_STATES = ["pending", "ready", "failed", "ambiguous"];
 var SUMMARY_PROMPT_KINDS = [
   "character",
+  "worldbook",
   "persona",
   "previous_summaries",
   "messages",
@@ -14586,6 +14587,7 @@ var SUMMARY_DELETION_POLICIES = [
 ];
 var STATUS_PROMPT_KINDS = [
   "character",
+  "worldbook",
   "persona",
   "current_state",
   "messages",
@@ -14776,8 +14778,7 @@ var extractionOperationSchema = external_exports.discriminatedUnion("action", [
     dataName: external_exports.string().trim().min(1).max(240),
     keywords: external_exports.array(external_exports.string().trim().min(1).max(240)).max(100).default([]),
     status: external_exports.enum(MEMORY_ENTRY_STATUSES),
-    values: external_exports.record(external_exports.string(), external_exports.unknown()),
-    evidenceMessageIds: external_exports.array(external_exports.string().max(240)).max(500).default([])
+    values: external_exports.record(external_exports.string(), external_exports.unknown())
   }),
   external_exports.object({
     action: external_exports.literal("update"),
@@ -14788,14 +14789,12 @@ var extractionOperationSchema = external_exports.discriminatedUnion("action", [
       keywords: external_exports.array(external_exports.string().trim().min(1).max(240)).max(100).optional(),
       status: external_exports.enum(MEMORY_ENTRY_STATUSES).optional(),
       values: external_exports.record(external_exports.string(), external_exports.unknown()).optional()
-    }).refine((changes) => Object.keys(changes).length > 0, "Update changes cannot be empty."),
-    evidenceMessageIds: external_exports.array(external_exports.string().max(240)).max(500).default([])
+    }).refine((changes) => Object.keys(changes).length > 0, "Update changes cannot be empty.")
   }),
   external_exports.object({
     action: external_exports.literal("delete"),
     typeId: identifierSchema,
-    rowId: identifierSchema,
-    evidenceMessageIds: external_exports.array(external_exports.string().max(240)).max(500).default([])
+    rowId: identifierSchema
   })
 ]);
 var extractionPayloadSchema = external_exports.object({
@@ -14917,9 +14916,10 @@ var summaryPromptItemSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({
     ...summaryPromptBase,
     kind: external_exports.literal("previous_summaries"),
-    count: external_exports.number().int().min(0).max(100)
+    count: external_exports.number().int().min(0).max(100),
+    unit: external_exports.enum(["slices", "batches"]).default("slices")
   }),
-  external_exports.object({ ...summaryPromptBase, kind: external_exports.enum(["character", "persona", "messages"]) })
+  external_exports.object({ ...summaryPromptBase, kind: external_exports.enum(["character", "worldbook", "persona", "messages"]) })
 ]);
 var summaryPromptPresetSchema = external_exports.object({
   id: identifierSchema,
@@ -14954,7 +14954,37 @@ var summaryBatchInputSchema = external_exports.object({
   messageIds: external_exports.array(external_exports.string().min(1).max(240)).min(1).max(500),
   sourceHash: external_exports.string().regex(/^[a-f0-9]{64}$/)
 });
+var summaryTimestampSchema = external_exports.string().trim().superRefine((value, context) => {
+  if (value === "unknown") return;
+  const match = /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T(\d{2}))?)?)?$/.exec(value);
+  if (!match) {
+    context.addIssue({
+      code: "custom",
+      message: "Summary timestamp must be YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH, or unknown."
+    });
+    return;
+  }
+  const month = match[2] === void 0 ? void 0 : Number(match[2]);
+  const day = match[3] === void 0 ? void 0 : Number(match[3]);
+  const hour = match[4] === void 0 ? void 0 : Number(match[4]);
+  if (month !== void 0 && (month < 1 || month > 12)) {
+    context.addIssue({ code: "custom", message: "Summary timestamp month must be between 01 and 12." });
+    return;
+  }
+  if (day !== void 0) {
+    const year = Number(match[1]);
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (day < 1 || day > days[month - 1]) {
+      context.addIssue({ code: "custom", message: "Summary timestamp contains an invalid calendar day." });
+    }
+  }
+  if (hour !== void 0 && (hour < 0 || hour > 23)) {
+    context.addIssue({ code: "custom", message: "Summary timestamp hour must be between 00 and 23." });
+  }
+});
 var summarySliceCandidateSchema = external_exports.object({
+  timestamp: summaryTimestampSchema,
   title: external_exports.string().trim().min(1).max(240),
   content: external_exports.string().trim().min(1).max(1e5),
   tags: external_exports.array(external_exports.string().trim().min(1).max(200)).max(100).default([])
@@ -15096,7 +15126,7 @@ var statusPromptItemSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ ...statusPromptBase, kind: external_exports.literal("custom"), content: external_exports.string().max(1e5) }),
   external_exports.object({
     ...statusPromptBase,
-    kind: external_exports.enum(["character", "persona", "current_state", "messages"])
+    kind: external_exports.enum(["character", "worldbook", "persona", "current_state", "messages"])
   })
 ]);
 var statusPromptPresetSchema = external_exports.object({
@@ -15162,6 +15192,22 @@ var statusPatchOperationSchema = external_exports.discriminatedUnion("op", [
 ]);
 var statusPayloadSchema = external_exports.object({
   operations: external_exports.array(statusPatchOperationSchema).max(500)
+}).strict();
+var statusProviderOperationSchema = external_exports.discriminatedUnion("op", [
+  external_exports.object({
+    op: external_exports.literal("set"),
+    path: external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(32),
+    value: jsonValueSchema,
+    evidenceMessageIds: external_exports.array(external_exports.string().trim().min(1).max(240)).max(500).optional()
+  }).strict(),
+  external_exports.object({
+    op: external_exports.literal("delete"),
+    path: external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(32),
+    evidenceMessageIds: external_exports.array(external_exports.string().trim().min(1).max(240)).max(500).optional()
+  }).strict()
+]);
+var statusProviderPayloadSchema = external_exports.object({
+  operations: external_exports.array(statusProviderOperationSchema).max(500)
 }).strict();
 var statusUpdateRequestSchema = external_exports.object({
   chatId: external_exports.string().trim().min(1).max(240),
@@ -15691,7 +15737,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "0.3.11",
+  version: "1.0.0",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -18697,8 +18743,7 @@ function buildExtractionMessages(request) {
           dataName: "row display name",
           keywords: ["optional keyword"],
           status: "permanent | keyword | vectorized",
-          values: { column_id: "typed value" },
-          evidenceMessageIds: ["supplied_message_id"]
+          values: { column_id: "typed value" }
         },
         {
           action: "update",
@@ -18709,14 +18754,12 @@ function buildExtractionMessages(request) {
             keywords: ["optional replacement"],
             status: "optional replacement",
             values: { column_id: "only changed values" }
-          },
-          evidenceMessageIds: ["supplied_message_id"]
+          }
         },
         {
           action: "delete",
           typeId: "existing_type_id",
-          rowId: "existing_row_id",
-          evidenceMessageIds: ["supplied_message_id"]
+          rowId: "existing_row_id"
         }
       ]
     }
@@ -18738,12 +18781,6 @@ function duplicateDataName(rows, typeId, dataName, exceptRowId) {
 function validateOperation(operation, types, rows, messageIds) {
   const type = types.get(operation.typeId);
   if (!type) throw new Error(`Operation references an unavailable type: ${operation.typeId}`);
-  if (operation.evidenceMessageIds.length === 0) {
-    throw new Error("Every operation requires evidence from an incremental message.");
-  }
-  if (operation.evidenceMessageIds.some((id) => !messageIds.has(id))) {
-    throw new Error("Evidence references messages outside the incremental request.");
-  }
   if (operation.action === "add") {
     if (duplicateDataName(rows, type.id, operation.dataName)) {
       throw new Error(`Data name already exists in ${type.name}: ${operation.dataName}`);
@@ -18757,7 +18794,7 @@ function validateOperation(operation, types, rows, messageIds) {
       status: operation.status,
       values,
       enabled: true,
-      source: { kind: "extraction", messageIds: operation.evidenceMessageIds },
+      source: { kind: "extraction", messageIds: [...messageIds] },
       revision: 1,
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
       updatedAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -18809,7 +18846,7 @@ var ExtractionService = class {
     }
     const types = new Map(request.types.map((type) => [type.id, type]));
     const simulatedRows = structuredClone(request.rows);
-    const messageIds = new Set(request.messages.map((message) => message.id));
+    const messageIds = request.messages.map((message) => message.id);
     const providerMessages = buildExtractionMessages(request);
     context.report(0.1, "Waiting for secondary API");
     const generated = await this.generation.run({
@@ -18878,8 +18915,8 @@ async function sourceMessagesHash(messages) {
 
 // src/server/services/summary-service.ts
 var OUTPUT_PROTOCOL = `Return exactly one JSON object with this shape:
-{"summaries":[{"title":"short title","content":"self-contained factual summary","tags":["optional tag"]}]}
-Produce between 1 and 50 summaries. Do not use Markdown fences or include any text outside the JSON object.`;
+{"summaries":[{"timestamp":"YYYY | YYYY-MM | YYYY-MM-DD | YYYY-MM-DDTHH | unknown","title":"short title","content":"self-contained factual summary in Chinese","tags":["entity or plot keyword"]}]}
+Every summary must have its own timestamp. Use unknown only when no in-universe year can be established. Produce between 1 and 50 summaries. Do not use Markdown fences or include any text outside the JSON object.`;
 var SummaryService = class {
   constructor(generation) {
     this.generation = generation;
@@ -19133,9 +19170,17 @@ async function statusStateHash(state) {
 }
 
 // src/server/services/status-service.ts
-var STATUS_OUTPUT_PROTOCOL = `Return exactly one JSON object with this shape:
-{"operations":[{"op":"set","path":["category","field"],"value":"new value","evidenceMessageIds":["message-id"]},{"op":"delete","path":["category","obsolete field"],"evidenceMessageIds":["message-id"]}]}
-Use only set and delete operations. Every operation must cite one or more supplied message IDs that directly support it. Return {"operations":[]} when nothing changed. Do not use Markdown fences or include any text outside the JSON object.`;
+var STATUS_OUTPUT_PROTOCOL = `You MUST output both sections in this exact order:
+<thinking>Your step-by-step state comparison, routing, cleanup, and final verification</thinking>
+{"operations":[{"op":"set","path":["category","field"],"value":"new value"},{"op":"delete","path":["category","obsolete field"]}]}
+Use only set and delete operations. Return {"operations":[]} when nothing changed. The JSON must appear after </thinking>. Do not include any other text.`;
+function parseStatusProviderOutput(raw) {
+  const match = raw.trim().match(/^<thinking>\s*([\s\S]+?)\s*<\/thinking>\s*([\s\S]+)$/i);
+  if (!match?.[1]?.trim() || !match[2]?.trim()) {
+    throw new Error("Status response must contain non-empty <thinking> followed by one JSON object.");
+  }
+  return statusProviderPayloadSchema.parse(parseProviderJsonObject(match[2]));
+}
 var StatusService = class {
   constructor(generation) {
     this.generation = generation;
@@ -19155,7 +19200,10 @@ var StatusService = class {
     context.report(0.1, "Waiting for status API");
     const generated = await this.generation.run({
       workflow: "status",
-      group: request.generationGroup,
+      group: {
+        ...request.generationGroup,
+        endpoints: request.generationGroup.endpoints.map((endpoint) => ({ ...endpoint, jsonMode: false }))
+      },
       policy: request.failoverPolicy,
       resumeAfterEndpointId: request.resumeAfterEndpointId,
       messages: providerMessages,
@@ -19176,27 +19224,31 @@ var StatusService = class {
       });
     }
     context.report(0.82, "Validating status update");
-    let payload;
+    let parsed;
     try {
-      payload = JSON.parse(generated.value.trim());
-    } catch {
-      throw Object.assign(new Error("Status response must be one complete JSON object."), {
+      parsed = parseStatusProviderOutput(generated.value);
+    } catch (error51) {
+      throw Object.assign(new Error(error51 instanceof Error ? error51.message : "Invalid status response."), {
         statusCode: 502,
         code: "INVALID_STATUS_RESPONSE"
       });
     }
-    const parsed = statusPayloadSchema.parse(payload);
+    const evidenceMessageIds = request.messages.map((message) => message.id);
+    const operations = parsed.operations.map((operation) => ({
+      ...operation,
+      evidenceMessageIds: [...evidenceMessageIds]
+    }));
     const state = applyStatusOperations({
       baseState: request.baseState,
-      operations: parsed.operations,
-      evidenceMessageIds: request.messages.map((message) => message.id),
+      operations,
+      evidenceMessageIds,
       validation: request.validation
     });
     const stateHash = await statusStateHash(state);
-    context.report(0.99, `Validated ${parsed.operations.length} status operations`);
+    context.report(0.99, `Validated ${operations.length} status operations`);
     return {
       outcome: "completed",
-      operations: parsed.operations,
+      operations,
       state,
       stateHash,
       attempts: generated.attempts
