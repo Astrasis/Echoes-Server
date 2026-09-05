@@ -14730,6 +14730,7 @@ var structuredMemoryCatalogSchema = external_exports.object({
   automation: external_exports.object({
     enabled: external_exports.boolean().default(false)
   }).default({ enabled: false }),
+  builtInTypeSetVersion: external_exports.number().int().min(0).default(0),
   lastProcessedMessageId: external_exports.string().max(240).optional(),
   updatedAt: external_exports.string().datetime()
 }).superRefine((catalog, context) => {
