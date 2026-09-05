@@ -15738,7 +15738,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.4",
+  version: "1.0.5",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -16978,8 +16978,23 @@ function embeddingUrl(baseUrl) {
   if (/\/v1$/i.test(normalized)) return `${normalized}/embeddings`;
   return `${normalized}/v1/embeddings`;
 }
-function statusError(status) {
-  return new RetrievalProviderError(`Provider returned HTTP ${status}.`, {
+function providerErrorDetail(raw) {
+  try {
+    const payload = JSON.parse(raw);
+    const source = typeof payload.error === "string" ? { message: payload.error } : payload.error ?? payload;
+    const parts = [
+      typeof source.message === "string" ? source.message.trim() : "",
+      typeof source.code === "string" ? source.code.trim() : "",
+      typeof source.type === "string" ? source.type.trim() : ""
+    ].filter(Boolean);
+    return parts.join(" \xB7 ").slice(0, 500);
+  } catch {
+    return "";
+  }
+}
+function statusError(status, raw) {
+  const detail = providerErrorDetail(raw);
+  return new RetrievalProviderError(`Provider returned HTTP ${status}${detail ? `: ${detail}` : "."}`, {
     ambiguous: status === 504,
     status,
     code: `PROVIDER_HTTP_${status}`
@@ -17014,7 +17029,7 @@ async function providerJson(options) {
       response,
       response.ok ? options.maxResponseBytes : MAX_PROVIDER_ERROR_BYTES
     );
-    if (!response.ok) throw statusError(response.status);
+    if (!response.ok) throw statusError(response.status, text);
     try {
       return JSON.parse(text);
     } catch {
