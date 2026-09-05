@@ -15738,7 +15738,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.3",
+  version: "1.0.4",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -16197,6 +16197,41 @@ var nodePersistenceAdapter = {
     }
   }
 };
+function summarizeJobResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return {};
+  const value = result;
+  const summary = {};
+  for (const key of [
+    "created",
+    "updated",
+    "unchanged",
+    "vectorized",
+    "pending",
+    "failed",
+    "ambiguous",
+    "deleted"
+  ]) {
+    const item = value[key];
+    if (typeof item === "number" && Number.isFinite(item)) summary[key] = item;
+  }
+  if (Array.isArray(value.attempts)) {
+    summary.attempts = value.attempts.filter((item) => Boolean(item) && typeof item === "object" && !Array.isArray(item)).flatMap((item) => {
+      const outcome = item.outcome;
+      if (!["succeeded", "definitive_failure", "ambiguous_failure", "skipped"].includes(String(outcome))) {
+        return [];
+      }
+      return [{
+        endpointId: String(item.endpointId ?? ""),
+        endpointName: String(item.endpointName ?? ""),
+        outcome,
+        durationMs: Number(item.durationMs ?? 0),
+        ...item.status === void 0 ? {} : { status: Number(item.status) },
+        ...item.message === void 0 ? {} : { message: String(item.message).slice(0, 500) }
+      }];
+    });
+  }
+  return summary;
+}
 function durableJobMessage(status) {
   switch (status) {
     case "queued":
@@ -16316,7 +16351,10 @@ var JobManager = class {
     const status = options.status;
     const type = options.type;
     const limit = Math.max(1, Math.min(500, Math.floor(options.limit ?? 200)));
-    const records = [...this.jobs.values()].filter((job) => (!status || job.status === status) && (!type || job.type === type)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, limit).map(({ result: _result, ...record2 }) => structuredClone(record2));
+    const records = [...this.jobs.values()].filter((job) => (!status || job.status === status) && (!type || job.type === type)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, limit).map(({ result, ...record2 }) => ({
+      ...structuredClone(record2),
+      resultSummary: summarizeJobResult(result)
+    }));
     return records;
   }
   async cancel(jobId) {
@@ -17192,43 +17230,61 @@ var RetrievalService = class {
       attempts: []
     };
     if (prepared.needsEmbedding.length === 0 || !request.embeddingGroup) return base;
-    context.report(0.2, `Embedding ${prepared.needsEmbedding.length} documents`);
-    const result = await runEndpointChain({
-      provider: "embedding",
-      endpoints: request.embeddingGroup.endpoints,
-      policy: request.failoverPolicy,
-      resumeAfterEndpointId: request.resumeAfterEndpointId,
-      health: this.embeddingHealth,
-      signal: context.signal,
-      resolveEndpoint: this.resolveEndpoint,
-      invoke: (endpoint) => requestEmbeddings({
-        endpoint,
-        texts: prepared.needsEmbedding.map((document) => document.text),
-        expectedDimensions: request.embeddingGroup.dimensions,
-        requestedDimensions: request.embeddingGroup.requestDimensions === false ? void 0 : request.embeddingGroup.dimensions,
-        signal: context.signal
-      })
-    });
-    base.attempts = result.attempts;
-    const documentIds = prepared.needsEmbedding.map((document) => document.documentId);
-    if (result.state === "succeeded" && result.value) {
-      await this.store.upsertVectors({
-        embeddingSpaceId: request.embeddingGroup.embeddingSpaceId,
-        dimensions: request.embeddingGroup.dimensions,
-        documents: prepared.needsEmbedding,
-        vectors: result.value
+    const documents = prepared.needsEmbedding;
+    let vectorized = 0;
+    let failed = 0;
+    let ambiguous = 0;
+    const attempts = [];
+    let decisionRequired;
+    for (let offset = 0; offset < documents.length; offset += 32) {
+      const batch = documents.slice(offset, offset + 32);
+      context.report(
+        Math.min(0.9, 0.2 + 0.7 * (offset / Math.max(1, documents.length))),
+        `Embedding ${offset + batch.length}/${documents.length}`
+      );
+      const result = await runEndpointChain({
+        provider: "embedding",
+        endpoints: request.embeddingGroup.endpoints,
+        policy: request.failoverPolicy,
+        resumeAfterEndpointId: request.resumeAfterEndpointId,
+        health: this.embeddingHealth,
+        signal: context.signal,
+        resolveEndpoint: this.resolveEndpoint,
+        invoke: (endpoint) => requestEmbeddings({
+          endpoint,
+          texts: batch.map((document) => document.text),
+          expectedDimensions: request.embeddingGroup.dimensions,
+          requestedDimensions: request.embeddingGroup.requestDimensions === false ? void 0 : request.embeddingGroup.dimensions,
+          signal: context.signal
+        })
       });
-      await this.store.markVectorState(documentIds, "ready");
-      return { ...base, vectorized: documentIds.length, pending: 0 };
+      attempts.push(...result.attempts.slice(-10));
+      const documentIds = batch.map((document) => document.documentId);
+      if (result.state === "succeeded" && result.value) {
+        await this.store.upsertVectors({
+          embeddingSpaceId: request.embeddingGroup.embeddingSpaceId,
+          dimensions: request.embeddingGroup.dimensions,
+          documents: batch,
+          vectors: result.value
+        });
+        await this.store.markVectorState(documentIds, "ready");
+        vectorized += documentIds.length;
+        continue;
+      }
+      const state = result.state === "ambiguous" ? "ambiguous" : "failed";
+      await this.store.markVectorState(documentIds, state);
+      if (state === "ambiguous") ambiguous += documentIds.length;
+      else failed += documentIds.length;
+      decisionRequired ??= result.decisionRequired;
     }
-    const state = result.state === "ambiguous" ? "ambiguous" : "failed";
-    await this.store.markVectorState(documentIds, state);
+    base.attempts = attempts;
     return {
       ...base,
+      vectorized,
       pending: 0,
-      failed: state === "failed" ? documentIds.length : 0,
-      ambiguous: state === "ambiguous" ? documentIds.length : 0,
-      ...result.decisionRequired ? { decisionRequired: result.decisionRequired } : {}
+      failed,
+      ambiguous,
+      ...decisionRequired ? { decisionRequired } : {}
     };
   }
   async rebuild(options, context) {
