@@ -14859,7 +14859,7 @@ var structuredExtractionBatchSchema = external_exports.object({
 var extractionReviewItemSchema = external_exports.object({
   index: external_exports.number().int().min(0).max(499),
   state: external_exports.enum(["valid", "rejected"]),
-  operation: extractionOperationSchema,
+  operation: external_exports.unknown(),
   reason: external_exports.string().max(2e3).optional()
 }).strict().superRefine((item, context) => {
   if (item.state === "rejected" && !item.reason) {
@@ -15739,7 +15739,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.6",
+  version: "1.0.7",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -18936,6 +18936,26 @@ function validateOperation(operation, types, rows, messageIds) {
     values: validateMemoryValues(type.columns, mergedValues)
   };
 }
+function parseOperation(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+      return { reason: "Operation must be a JSON object; the model returned a string." };
+    }
+    try {
+      return parseOperation(JSON.parse(trimmed));
+    } catch {
+      return { reason: "Operation is a string but is not valid JSON." };
+    }
+  }
+  const result = extractionOperationSchema.safeParse(value);
+  if (result.success) return { operation: result.data };
+  const issue2 = result.error.issues[0];
+  const path6 = issue2.path.length > 0 ? ` at ${issue2.path.join(".")}` : "";
+  return {
+    reason: `Invalid operation${path6}: ${issue2?.message ?? "the object does not match the required protocol."}`
+  };
+}
 var ExtractionService = class {
   constructor(generation) {
     this.generation = generation;
@@ -18984,11 +19004,26 @@ var ExtractionService = class {
       });
     }
     context.report(0.8, "Validating proposed memory operations");
-    const payload = extractionPayloadSchema.parse(parseProviderJsonObject(generated.value));
+    const parsedPayload = parseProviderJsonObject(generated.value);
+    const rawOperations = Array.isArray(parsedPayload.operations) ? parsedPayload.operations : [];
+    if (rawOperations.length > 500) {
+      throw Object.assign(new Error("Extraction response contains more than 500 operations."), {
+        statusCode: 502,
+        code: "INVALID_EXTRACTION_RESPONSE"
+      });
+    }
     const operations = [];
     const rejectedOperations = [];
     const reviewItems = [];
-    for (const [index, operation] of payload.operations.entries()) {
+    for (const [index, candidate] of rawOperations.entries()) {
+      const parsed = parseOperation(candidate);
+      if (!parsed.operation) {
+        const reason = parsed.reason ?? "Invalid extraction operation.";
+        rejectedOperations.push({ operation: candidate, reason });
+        reviewItems.push({ index, state: "rejected", operation: candidate, reason });
+        continue;
+      }
+      const operation = parsed.operation;
       try {
         validateOperation(operation, types, simulatedRows, messageIds);
         operations.push(operation);
@@ -19002,8 +19037,8 @@ var ExtractionService = class {
         reviewItems.push({ index, state: "rejected", operation, reason });
       }
       context.report(
-        0.8 + (index + 1) / Math.max(payload.operations.length, 1) * 0.19,
-        `Validating operation ${index + 1}/${payload.operations.length}`
+        0.8 + (index + 1) / Math.max(rawOperations.length, 1) * 0.19,
+        `Validating operation ${index + 1}/${rawOperations.length}`
       );
     }
     return {
