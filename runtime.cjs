@@ -15290,6 +15290,7 @@ var retrievalDocumentInputSchema = external_exports.object({
 var retrievalRequestOptions = {
   failoverPolicy: failoverPolicySchema.default("confirm_ambiguous"),
   embeddingGroup: embeddingEndpointGroupSchema.optional(),
+  embeddingBatchSize: external_exports.number().int().min(1).max(100).default(10),
   resumeAfterEndpointId: identifierSchema.optional()
 };
 var retrievalUpsertRequestSchema = external_exports.object({
@@ -15738,7 +15739,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.5",
+  version: "1.0.6",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -17251,8 +17252,9 @@ var RetrievalService = class {
     let ambiguous = 0;
     const attempts = [];
     let decisionRequired;
-    for (let offset = 0; offset < documents.length; offset += 32) {
-      const batch = documents.slice(offset, offset + 32);
+    const embeddingBatchSize = Math.max(1, Math.min(100, request.embeddingBatchSize ?? 10));
+    for (let offset = 0; offset < documents.length; offset += embeddingBatchSize) {
+      const batch = documents.slice(offset, offset + embeddingBatchSize);
       context.report(
         Math.min(0.9, 0.2 + 0.7 * (offset / Math.max(1, documents.length))),
         `Embedding ${offset + batch.length}/${documents.length}`
