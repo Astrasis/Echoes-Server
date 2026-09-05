@@ -15738,7 +15738,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.2",
+  version: "1.0.3",
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -15831,6 +15831,28 @@ function retrieval(runtime) {
 }
 function registerRoutes(options) {
   const { router, runtimes: runtimes2 } = options;
+  const jobFilter = (request) => {
+    const status = request.query.status;
+    const type = request.query.type;
+    const rawLimit = request.query.limit;
+    const parsedLimit = Number(rawLimit);
+    if (rawLimit !== void 0 && (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 500)) {
+      throw Object.assign(new Error("Job limit must be an integer between 1 and 500."), {
+        statusCode: 400
+      });
+    }
+    if (status !== void 0 && !/^[a-z_]{1,100}$/.test(String(status))) {
+      throw Object.assign(new Error("Job status filter is invalid."), { statusCode: 400 });
+    }
+    if (type !== void 0 && !/^[a-z0-9_-]{1,200}$/.test(String(type))) {
+      throw Object.assign(new Error("Job type filter is invalid."), { statusCode: 400 });
+    }
+    return {
+      ...status === void 0 ? {} : { status: String(status) },
+      ...type === void 0 ? {} : { type: String(type) },
+      ...parsedLimit === void 0 || Number.isNaN(parsedLimit) ? {} : { limit: parsedLimit }
+    };
+  };
   router.get("/health", (_request, response) => {
     response.json({ ok: true, build: ECHOES_BUILD_INFO });
   });
@@ -15842,6 +15864,13 @@ function registerRoutes(options) {
       const protocol = rawProtocol === void 0 ? void 0 : Number(rawProtocol);
       response.json(await runtime.systemService.status(protocol));
     }, true)
+  );
+  router.get(
+    "/jobs",
+    route(async (request, response) => {
+      const runtime = await runtimes2.forRequest(request);
+      response.json({ jobs: runtime.jobs.list(jobFilter(request)) });
+    })
   );
   router.post(
     "/system/diagnostics",
@@ -16282,6 +16311,13 @@ var JobManager = class {
       };
     }
     return structuredClone(job);
+  }
+  list(options = {}) {
+    const status = options.status;
+    const type = options.type;
+    const limit = Math.max(1, Math.min(500, Math.floor(options.limit ?? 200)));
+    const records = [...this.jobs.values()].filter((job) => (!status || job.status === status) && (!type || job.type === type)).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, limit).map(({ result: _result, ...record2 }) => structuredClone(record2));
+    return records;
   }
   async cancel(jobId) {
     await this.initialize();
