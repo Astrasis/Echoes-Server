@@ -15323,6 +15323,7 @@ var retrievalRebuildRequestSchema = external_exports.object({
   collectionIds: external_exports.array(identifierSchema).min(1).max(100),
   failoverPolicy: failoverPolicySchema.default("confirm_ambiguous"),
   embeddingGroup: embeddingEndpointGroupSchema,
+  embeddingBatchSize: external_exports.number().int().min(1).max(100).default(10),
   resumeAfterEndpointId: identifierSchema.optional()
 });
 var retrievalQueryPresetBase = {
@@ -15739,7 +15740,11 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 // package.json
 var package_default = {
   name: "echoes-memory-system",
-  version: "1.0.7",
+  version: "2.0.0",
+  echoesVersions: {
+    extension: "2.0.0",
+    server: "1.1.0"
+  },
   private: true,
   type: "module",
   description: "A reliable structured and semantic memory system for SillyTavern.",
@@ -15751,9 +15756,10 @@ var package_default = {
     build: "node scripts/build.mjs",
     check: "npm run typecheck && npm run test && npm run build",
     test: "vitest run",
-    "test:browser": "npm run build && playwright test",
+    "test:browser": "npm run build && playwright test --config playwright.workbench.config.ts",
     "test:watch": "vitest",
     "serve:harness": "node scripts/ui-harness-server.mjs",
+    "serve:workbench": "node scripts/workbench-server.mjs",
     "stress:retrieval": "node scripts/retrieval-stress.mjs 200000",
     "audit:dependencies": "npm audit --registry=https://registry.npmjs.org/ --omit=dev --audit-level=high",
     "audit:release": "node scripts/audit-release.mjs",
@@ -15782,8 +15788,17 @@ var package_default = {
 };
 
 // src/shared/build-info.ts
+var ECHOES_VERSIONS = Object.freeze({
+  extension: package_default.echoesVersions.extension,
+  server: package_default.echoesVersions.server
+});
 var ECHOES_BUILD_INFO = {
-  appVersion: package_default.version,
+  appVersion: ECHOES_VERSIONS.extension,
+  apiProtocolVersion: API_PROTOCOL_VERSION,
+  service: "echoes-memory"
+};
+var ECHOES_SERVER_BUILD_INFO = {
+  appVersion: ECHOES_VERSIONS.server,
   apiProtocolVersion: API_PROTOCOL_VERSION,
   service: "echoes-memory"
 };
@@ -15805,7 +15820,7 @@ function route(handler, allowIncompatible = false) {
       response.status(426).json({
         error: `Echoes API protocol ${Number.isInteger(protocol) ? `v${protocol}` : "header is invalid"}; server protocol is v${API_PROTOCOL_VERSION}.`,
         code: "ECHOES_PROTOCOL_INCOMPATIBLE",
-        build: ECHOES_BUILD_INFO
+        build: ECHOES_SERVER_BUILD_INFO
       });
       return;
     }
@@ -15855,7 +15870,7 @@ function registerRoutes(options) {
     };
   };
   router.get("/health", (_request, response) => {
-    response.json({ ok: true, build: ECHOES_BUILD_INFO });
+    response.json({ ok: true, build: ECHOES_SERVER_BUILD_INFO });
   });
   router.get(
     "/system/status",
@@ -17324,7 +17339,12 @@ var RetrievalService = class {
     };
     let processed = 0;
     const states = options.onlyUnready ? ["pending", "failed", "ambiguous"] : [];
-    for await (const documents of this.store.documentBatches(options.collectionIds, 32, [...states])) {
+    const embeddingBatchSize = Math.max(1, Math.min(100, options.embeddingBatchSize ?? 10));
+    for await (const documents of this.store.documentBatches(
+      options.collectionIds,
+      embeddingBatchSize,
+      [...states]
+    )) {
       if (context.signal.aborted) throw context.signal.reason ?? new Error("Cancelled.");
       context.report(total === 0 ? 0.9 : Math.min(0.9, processed / total), `Embedding ${processed}/${total}`);
       const result = await runEndpointChain({
@@ -19005,7 +19025,19 @@ var ExtractionService = class {
     }
     context.report(0.8, "Validating proposed memory operations");
     const parsedPayload = parseProviderJsonObject(generated.value);
-    const rawOperations = Array.isArray(parsedPayload.operations) ? parsedPayload.operations : [];
+    if (!parsedPayload || typeof parsedPayload !== "object" || Array.isArray(parsedPayload)) {
+      throw Object.assign(new Error("Extraction response must be a JSON object with an operations array."), {
+        statusCode: 502,
+        code: "INVALID_EXTRACTION_RESPONSE"
+      });
+    }
+    const rawOperations = parsedPayload.operations;
+    if (!Array.isArray(rawOperations)) {
+      throw Object.assign(new Error("Extraction response field operations must be an array."), {
+        statusCode: 502,
+        code: "INVALID_EXTRACTION_RESPONSE"
+      });
+    }
     if (rawOperations.length > 500) {
       throw Object.assign(new Error("Extraction response contains more than 500 operations."), {
         statusCode: 502,
@@ -19422,7 +19454,7 @@ var SystemService = class {
     const permissions = await this.options.credentials.permissions().catch(() => ({ exists: false, secure: false }));
     const credentialsReadable = await this.options.credentials.list().then(() => true, () => false);
     return {
-      build: ECHOES_BUILD_INFO,
+      build: ECHOES_SERVER_BUILD_INFO,
       protocolCompatible: protocolCompatible(clientProtocol),
       platform: {
         node: process.versions.node,
@@ -19473,10 +19505,10 @@ var SystemService = class {
     }
     const checks = [
       check2(
-        "app_version",
-        "Application version",
-        !input.clientVersion ? "unavailable" : input.clientVersion === status.build.appVersion ? "pass" : "warning",
-        !input.clientVersion ? "No client application version was submitted." : input.clientVersion === status.build.appVersion ? `Client and server are both Echoes ${status.build.appVersion}.` : `Client Echoes ${input.clientVersion} is connected to server Echoes ${status.build.appVersion}; protocol compatibility determines task availability.`
+        "component_versions",
+        "Component versions",
+        !input.clientVersion ? "unavailable" : "pass",
+        !input.clientVersion ? `Extension version was not submitted; server is Echoes ${status.build.appVersion}.` : `Extension Echoes ${input.clientVersion}; server Echoes ${status.build.appVersion}. Components are versioned independently.`
       ),
       check2(
         "api_protocol",
