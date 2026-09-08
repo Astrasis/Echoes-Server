@@ -14754,7 +14754,7 @@ var memoryRowSourceSchema = external_exports.object({
   messageIds: external_exports.array(external_exports.string().max(240)).max(500).default([]),
   jobId: external_exports.string().max(240).optional(),
   batchId: identifierSchema.optional(),
-  extractionMode: external_exports.enum(["auto", "manual"]).optional()
+  extractionMode: external_exports.enum(["auto", "manual", "cleaning"]).optional()
 });
 var memoryRowInputSchema = external_exports.object({
   dataName: external_exports.string().trim().min(1).max(240),
@@ -14839,7 +14839,7 @@ var generationEndpointGroupSchema = external_exports.object({
 }).superRefine((group, context) => validateEndpointOrder(group.endpoints, context));
 var structuredExtractionBatchSchema = external_exports.object({
   id: identifierSchema,
-  mode: external_exports.enum(["auto", "manual"]),
+  mode: external_exports.enum(["auto", "manual", "cleaning"]),
   startMessageId: external_exports.string().min(1).max(240),
   endMessageId: external_exports.string().min(1).max(240),
   messageIds: external_exports.array(external_exports.string().min(1).max(240)).min(1).max(500),
@@ -14878,7 +14878,8 @@ var extractionRequestSchema = external_exports.object({
   messages: external_exports.array(chatMessageSchema).min(1).max(500),
   generationGroup: generationEndpointGroupSchema,
   failoverPolicy: failoverPolicySchema.default("confirm_ambiguous"),
-  resumeAfterEndpointId: identifierSchema.optional()
+  resumeAfterEndpointId: identifierSchema.optional(),
+  additionalInstructions: external_exports.string().max(2e4).optional()
 }).superRefine((request, context) => {
   const requestMessageIds = request.messages.map((message) => message.id);
   if (JSON.stringify(requestMessageIds) !== JSON.stringify(request.batch.messageIds)) {
@@ -14896,6 +14897,7 @@ var extractionRequestSchema = external_exports.object({
     types: request.types,
     rows: request.rows,
     promptMessages: request.promptMessages,
+    additionalInstructions: request.additionalInstructions,
     messages: request.messages
   }).length;
   if (characterCount > MAX_EXTRACTION_CHARACTERS) {
@@ -15738,7 +15740,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 }
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "1.1.1", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "1.2.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -18430,6 +18432,96 @@ function structuredExtractionContextHash(types, rows) {
   });
 }
 
+// src/shared/extraction-references.ts
+var EXTRACTION_ROW_REFERENCE_GUIDE = `Record references for this request:
+currentRows supplies short rowId references such as R1 and R2. For update or delete, copy the rowId and typeId together from the same currentRows record. These references apply only to this request; the application resolves them to stored IDs.
+For a new record, use add without a rowId and include its complete intended content. Combine changes to a newly proposed record into that add, rather than inventing an ID for a later update. Combine changes to an existing record into one operation.
+Return the operations JSON object only, with Chinese natural-language values.`;
+var EXTRACTION_CLEANING_GUIDE = `This is a user-requested memory cleaning pass over a selected historical message range, not the next incremental batch.
+Look for useful information previously missed. Compare concrete facts with currentRows and propose additions or updates that fill omissions. A previously processed message may still contain unrecorded information.
+Retain valid existing knowledge. Preserve the chronology of historical facts; an earlier condition is not evidence that a later known condition should be reverted. Propose deletions only when explicitly supported. The application will present the proposals for review and preserve the normal extraction checkpoint.`;
+function extractionProviderMessages(request) {
+  return [
+    ...request.promptMessages,
+    { role: "system", content: EXTRACTION_ROW_REFERENCE_GUIDE },
+    ...request.batch.mode === "cleaning" ? [{ role: "system", content: EXTRACTION_CLEANING_GUIDE }] : [],
+    { role: "user", content: JSON.stringify(extractionRuntimeInput(request)) },
+    ...request.additionalInstructions?.trim() ? [{ role: "system", content: request.additionalInstructions.trim() }] : []
+  ];
+}
+function extractionRowReferences(rows) {
+  const storedIds = new Set(rows.map((row) => row.id));
+  const references = /* @__PURE__ */ new Map();
+  let index = 1;
+  for (const row of rows) {
+    while (storedIds.has(`R${index}`)) index += 1;
+    references.set(`R${index++}`, row.id);
+  }
+  return references;
+}
+function extractionRuntimeInput(request) {
+  const referenceById = new Map([...extractionRowReferences(request.rows)].map(([ref, id]) => [id, ref]));
+  return {
+    activeTypes: request.types.map((type) => ({
+      id: type.id,
+      name: type.name,
+      columns: type.columns.map((column) => ({
+        id: column.id,
+        name: column.name,
+        type: column.type,
+        required: column.required,
+        description: column.description ?? "",
+        enumValues: column.enumValues ?? []
+      }))
+    })),
+    currentRows: request.rows.map((row) => ({
+      rowId: referenceById.get(row.id),
+      typeId: row.typeId,
+      dataName: row.dataName,
+      keywords: row.keywords,
+      status: row.status,
+      values: row.values
+    })),
+    incrementalMessages: request.messages,
+    responseShape: {
+      operations: [
+        {
+          action: "add",
+          typeId: "existing_type_id",
+          dataName: "row display name",
+          keywords: ["optional keyword"],
+          status: "permanent | keyword | vectorized",
+          values: { column_id: "typed value" }
+        },
+        {
+          action: "update",
+          typeId: "existing_type_id",
+          rowId: "copy_from_currentRows",
+          changes: {
+            dataName: "optional replacement",
+            keywords: ["optional replacement"],
+            status: "optional replacement",
+            values: { column_id: "only changed values" }
+          }
+        },
+        { action: "delete", typeId: "existing_type_id", rowId: "copy_from_currentRows" }
+      ]
+    }
+  };
+}
+function unavailableExtractionRowReason(rowId, typeId, initialRows, currentRows) {
+  const initial = initialRows.find((row) => row.id === rowId);
+  const prefix = `Operation references an unavailable row: ${rowId}. `;
+  if (!initial) return prefix + "\u8BE5\u5F15\u7528\u4E0D\u5728\u672C\u6B21\u8BF7\u6C42\u7684 currentRows \u4E2D\uFF1B\u65B0\u589E\u8BB0\u5F55\u5E94\u4F7F\u7528 add\uFF0C\u4E0D\u80FD\u81EA\u884C\u751F\u6210 rowId\u3002";
+  if (initial.typeId !== typeId) {
+    return prefix + `\u8BB0\u5F55\u201C${initial.dataName}\u201D\u5C5E\u4E8E ${initial.typeId}\uFF0C\u64CD\u4F5C\u5374\u6307\u5B9A\u4E86 ${typeId}\uFF1BrowId \u4E0E typeId \u5FC5\u987B\u6765\u81EA\u540C\u4E00\u6761\u8BB0\u5F55\u3002`;
+  }
+  if (!currentRows.some((row) => row.id === rowId)) {
+    return prefix + `\u8BB0\u5F55\u201C${initial.dataName}\u201D\u5DF2\u88AB\u672C\u6279\u66F4\u65E9\u7684\u64CD\u4F5C\u5220\u9664\uFF1B\u8BF7\u5408\u5E76\u5BF9\u540C\u4E00\u6761\u8BB0\u5F55\u7684\u4FEE\u6539\u3002`;
+  }
+  return prefix + "\u5F53\u524D\u8BB0\u5F55\u5DF2\u4E0D\u53EF\u7528\uFF0C\u8BF7\u5237\u65B0\u8BB0\u5F55\u540E\u91CD\u8BD5\u3002";
+}
+
 // src/server/providers/openai-compatible.ts
 var ProviderCallError = class extends RetrievalProviderError {
   constructor(message, status, retryable, ambiguous = false) {
@@ -18774,71 +18866,8 @@ var GenerationService = class {
 };
 
 // src/server/services/extraction-service.ts
-function typePromptShape(type) {
-  return {
-    id: type.id,
-    name: type.name,
-    columns: type.columns.map((column) => ({
-      id: column.id,
-      name: column.name,
-      type: column.type,
-      required: column.required,
-      description: column.description ?? "",
-      enumValues: column.enumValues ?? []
-    }))
-  };
-}
-function rowPromptShape(row) {
-  return {
-    rowId: row.id,
-    typeId: row.typeId,
-    dataName: row.dataName,
-    keywords: row.keywords,
-    status: row.status,
-    values: row.values
-  };
-}
 function buildExtractionMessages(request) {
-  const runtimeInput = {
-    activeTypes: request.types.map(typePromptShape),
-    currentRows: request.rows.map(rowPromptShape),
-    incrementalMessages: request.messages,
-    responseShape: {
-      operations: [
-        {
-          action: "add",
-          typeId: "existing_type_id",
-          dataName: "row display name",
-          keywords: ["optional keyword"],
-          status: "permanent | keyword | vectorized",
-          values: { column_id: "typed value" }
-        },
-        {
-          action: "update",
-          typeId: "existing_type_id",
-          rowId: "existing_row_id",
-          changes: {
-            dataName: "optional replacement",
-            keywords: ["optional replacement"],
-            status: "optional replacement",
-            values: { column_id: "only changed values" }
-          }
-        },
-        {
-          action: "delete",
-          typeId: "existing_type_id",
-          rowId: "existing_row_id"
-        }
-      ]
-    }
-  };
-  return [
-    ...request.promptMessages,
-    {
-      role: "user",
-      content: JSON.stringify(runtimeInput)
-    }
-  ];
+  return extractionProviderMessages(request);
 }
 function duplicateDataName(rows, typeId, dataName, exceptRowId) {
   const normalized = dataName.trim().toLocaleLowerCase();
@@ -18846,7 +18875,7 @@ function duplicateDataName(rows, typeId, dataName, exceptRowId) {
     (row) => row.typeId === typeId && row.id !== exceptRowId && row.dataName.trim().toLocaleLowerCase() === normalized
   );
 }
-function validateOperation(operation, types, rows, messageIds) {
+function validateOperation(operation, types, rows, messageIds, initialRows) {
   const type = types.get(operation.typeId);
   if (!type) throw new Error(`Operation references an unavailable type: ${operation.typeId}`);
   if (operation.action === "add") {
@@ -18871,8 +18900,8 @@ function validateOperation(operation, types, rows, messageIds) {
   }
   const rowIndex = rows.findIndex((row) => row.id === operation.rowId);
   const current = rows[rowIndex];
-  if (!current || current.typeId !== type.id) {
-    throw new Error(`Operation references an unavailable row: ${operation.rowId}`);
+  if (!initialRows.some((row) => row.id === operation.rowId) || !current || current.typeId !== type.id) {
+    throw new Error(unavailableExtractionRowReason(operation.rowId, type.id, initialRows, rows));
   }
   if (operation.action === "delete") {
     rows.splice(rowIndex, 1);
@@ -18934,6 +18963,7 @@ var ExtractionService = class {
     }
     const types = new Map(request.types.map((type) => [type.id, type]));
     const simulatedRows = structuredClone(request.rows);
+    const rowReferences = extractionRowReferences(request.rows);
     const messageIds = request.messages.map((message) => message.id);
     const providerMessages = buildExtractionMessages(request);
     context.report(0.1, "Waiting for secondary API");
@@ -18993,9 +19023,12 @@ var ExtractionService = class {
         reviewItems.push({ index, state: "rejected", operation: candidate, reason });
         continue;
       }
-      const operation = parsed.operation;
+      const operation = parsed.operation.action === "add" ? parsed.operation : {
+        ...parsed.operation,
+        rowId: rowReferences.get(parsed.operation.rowId) ?? parsed.operation.rowId
+      };
       try {
-        validateOperation(operation, types, simulatedRows, messageIds);
+        validateOperation(operation, types, simulatedRows, messageIds, request.rows);
         operations.push(operation);
         reviewItems.push({ index, state: "valid", operation });
       } catch (error51) {
