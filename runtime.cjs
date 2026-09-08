@@ -15737,73 +15737,11 @@ function validateMemoryValues(columns, rawValues, options = {}) {
   return values;
 }
 
-// package.json
-var package_default = {
-  name: "echoes-memory-system",
-  version: "2.0.0",
-  echoesVersions: {
-    extension: "2.0.0",
-    server: "1.1.0"
-  },
-  private: true,
-  type: "module",
-  description: "A reliable structured and semantic memory system for SillyTavern.",
-  license: "CC-BY-NC-4.0",
-  engines: {
-    node: ">=20.9.0 <21 || >=22.0.0 <23 || >=24.0.0 <25"
-  },
-  scripts: {
-    build: "node scripts/build.mjs",
-    check: "npm run typecheck && npm run test && npm run build",
-    test: "vitest run",
-    "test:browser": "npm run build && playwright test --config playwright.workbench.config.ts",
-    "test:watch": "vitest",
-    "serve:harness": "node scripts/ui-harness-server.mjs",
-    "serve:workbench": "node scripts/workbench-server.mjs",
-    "stress:retrieval": "node scripts/retrieval-stress.mjs 200000",
-    "audit:dependencies": "npm audit --registry=https://registry.npmjs.org/ --omit=dev --audit-level=high",
-    "audit:release": "node scripts/audit-release.mjs",
-    "package:github": "npm run build && npm run audit:release && npm run audit:dependencies && node scripts/package-github.mjs",
-    "test:release": "node scripts/release-install-test.mjs",
-    typecheck: "tsc --noEmit"
-  },
-  dependencies: {
-    "@lancedb/lancedb": "0.31.0",
-    "ipaddr.js": "2.2.0",
-    yaml: "^2.9.0",
-    zod: "^4.4.3"
-  },
-  overrides: {
-    sharp: "0.35.3",
-    tar: "7.5.22"
-  },
-  devDependencies: {
-    "@playwright/test": "^1.61.1",
-    "@types/express": "^5.0.6",
-    "@types/node": "^26.1.1",
-    esbuild: "^0.28.1",
-    typescript: "^7.0.2",
-    vitest: "^4.1.10"
-  }
-};
-
 // src/shared/build-info.ts
-var ECHOES_VERSIONS = Object.freeze({
-  extension: package_default.echoesVersions.extension,
-  server: package_default.echoesVersions.server
-});
-var ECHOES_BUILD_INFO = {
-  appVersion: ECHOES_VERSIONS.extension,
-  apiProtocolVersion: API_PROTOCOL_VERSION,
-  service: "echoes-memory"
-};
-var ECHOES_SERVER_BUILD_INFO = {
-  appVersion: ECHOES_VERSIONS.server,
-  apiProtocolVersion: API_PROTOCOL_VERSION,
-  service: "echoes-memory"
-};
-function protocolCompatible(clientProtocol) {
-  return clientProtocol === void 0 || clientProtocol === API_PROTOCOL_VERSION;
+var ECHOES_BUILD_INFO = { appVersion: "1.1.1", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
+function protocolCompatible(value) {
+  return value === void 0 || value === API_PROTOCOL_VERSION;
 }
 
 // src/server/http/routes.ts
@@ -19596,22 +19534,22 @@ var SystemService = class {
       check2(
         "worldbook_format",
         "Worldbook format",
-        formatVersions.every((version2) => version2 >= 2) ? "pass" : formatVersions.length ? "warning" : "unavailable",
+        !formatVersions.length ? "unavailable" : formatVersions.every((version2) => version2 >= 2) ? "pass" : "warning",
         formatVersions.length ? `Observed formats: ${[...new Set(formatVersions)].join(", ")}.` : "No current-worldbook metadata was submitted.",
         formatVersions.some((version2) => version2 < 2) ? "summary_format" : void 0
       ),
       check2(
         "temporary_injections",
         "Temporary injections",
-        (input.worldbook?.staleInjectionCount ?? 0) === 0 ? "pass" : "warning",
-        `${input.worldbook?.staleInjectionCount ?? 0} stale temporary injections reported.`,
+        input.worldbook?.staleInjectionCount === void 0 ? "unavailable" : input.worldbook.staleInjectionCount === 0 ? "pass" : "warning",
+        input.worldbook?.staleInjectionCount === void 0 ? "Temporary injections were not inspected." : `${input.worldbook.staleInjectionCount} stale temporary injections reported.`,
         (input.worldbook?.staleInjectionCount ?? 0) > 0 ? "temporary_injections" : void 0
       ),
       check2(
         "summary_index",
         "Summary index consistency",
-        (input.worldbook?.summaryIndexMismatches ?? 0) === 0 ? "pass" : "warning",
-        `${input.worldbook?.summaryIndexMismatches ?? 0} summary index mismatches reported.`,
+        input.worldbook?.summaryIndexMismatches === void 0 ? "unavailable" : input.worldbook.summaryIndexMismatches === 0 ? "pass" : "warning",
+        input.worldbook?.summaryIndexMismatches === void 0 ? "Summary index was not inspected." : `${input.worldbook.summaryIndexMismatches} summary index mismatches reported.`,
         (input.worldbook?.summaryIndexMismatches ?? 0) > 0 ? "retrieval_index" : void 0
       )
     ];
