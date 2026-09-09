@@ -1,6 +1,6 @@
 {
   "name": "echoes-memory-server",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "private": true,
   "main": "index.js",
   "license": "CC-BY-NC-4.0",
@@ -12,7 +12,7 @@
     "ipaddr.js": "2.2.0"
   },
   "overrides": {
-    "sharp": "0.35.3",
+    "sharp": "0.35.4",
     "tar": "7.5.22"
   }
 }

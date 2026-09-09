@@ -14621,7 +14621,7 @@ var JOB_STATUSES = [
   "cancelled",
   "ambiguous"
 ];
-var API_PROTOCOL_VERSION = 1;
+var API_PROTOCOL_VERSION = 2;
 var REPAIR_KINDS = [
   "credential_permissions",
   "settings_format",
@@ -15007,6 +15007,7 @@ var summaryBatchMetadataSchema = summaryBatchInputSchema.extend({
   updatedAt: external_exports.string().datetime()
 }).strict();
 var summarySliceSchema = summarySliceCandidateSchema.extend({
+  recallFlags: external_exports.array(identifierSchema).max(100).optional(),
   id: identifierSchema,
   batch: summaryBatchMetadataSchema,
   sliceNumber: external_exports.number().int().min(1).max(50),
@@ -15031,20 +15032,42 @@ var messageCompressionMarkerSchema = external_exports.object({
   hiddenAt: external_exports.string().datetime().optional(),
   updatedAt: external_exports.string().datetime()
 }).strict();
+var recallFlagRulesSchema = external_exports.array(external_exports.object({
+  id: identifierSchema,
+  name: external_exports.string().trim().min(1).max(200),
+  addWeight: external_exports.number().min(-1).max(1).default(0),
+  multiplyWeight: external_exports.number().min(0).max(10).default(0),
+  retentionTurns: external_exports.number().int().min(0).max(100).default(0)
+})).max(100).refine(
+  (tags) => new Set(tags.map((tag) => tag.name)).size === tags.length,
+  "\u6807\u5FD7\u540D\u79F0\u4E0D\u80FD\u91CD\u590D\u3002"
+).refine(
+  (flags) => new Set(flags.map((flag) => flag.id)).size === flags.length,
+  "\u6807\u5FD7 ID \u4E0D\u80FD\u91CD\u590D\u3002"
+);
+var recallPoolReferenceSchema = external_exports.object({ namespaceId: identifierSchema, sliceId: identifierSchema });
+var recallPoolSchema = external_exports.object({
+  floorKey: external_exports.string().max(1e3),
+  entries: external_exports.array(recallPoolReferenceSchema.extend({ remaining: external_exports.number().int().min(1).max(100) })).max(1e3),
+  replay: external_exports.array(recallPoolReferenceSchema).max(1e3)
+});
 var summaryCatalogSchema = external_exports.object({
   formatVersion: external_exports.union([external_exports.literal(1), external_exports.literal(2)]),
   chatId: external_exports.string().trim().min(1).max(240),
   namespaceId: identifierSchema,
   autoRun: external_exports.boolean(),
   recallEnabled: external_exports.boolean().default(false),
-  recallSourceWeight: external_exports.number().min(0.1).max(10).default(1),
+  recallSourceWeight: external_exports.number().min(0).max(10).default(0),
+  recallSourceAddWeight: external_exports.number().min(-1).max(1).default(0),
+  recallPool: recallPoolSchema.optional(),
   recallSourceOrder: external_exports.number().int().min(0).max(1e3).default(0),
   attachedRecallSources: external_exports.array(external_exports.object({
     chatId: external_exports.string().trim().min(1).max(240),
     namespaceId: identifierSchema,
     worldbookName: external_exports.string().trim().min(1).max(500),
     enabled: external_exports.boolean().default(true),
-    weight: external_exports.number().min(0.1).max(10).default(1),
+    weight: external_exports.number().min(0).max(10).default(0),
+    addWeight: external_exports.number().min(-1).max(1).default(0),
     order: external_exports.number().int().min(0).max(1e3)
   })).max(100).default([]),
   compression: summaryCompressionConfigSchema.default({
@@ -15421,13 +15444,21 @@ var statusSnapshotSchema = external_exports.object({
 }).strict();
 var retrievalSourceWeightSchema = external_exports.object({
   collectionId: identifierSchema,
-  weight: external_exports.number().min(0.1).max(10).default(1),
+  weight: external_exports.number().min(0).max(10).default(0),
+  addWeight: external_exports.number().min(-1).max(1).default(0),
   order: external_exports.number().int().min(0).max(1e3)
 });
 var retrievalQueryRequestSchema = external_exports.object({
   collectionIds: external_exports.array(identifierSchema).min(1).max(100),
   vectorCollectionIds: external_exports.array(identifierSchema).max(100).optional(),
   sourceWeights: external_exports.array(retrievalSourceWeightSchema).max(100).optional(),
+  minimumRelevance: external_exports.number().finite().default(0),
+  flagRules: recallFlagRulesSchema.default([]),
+  flagAssignments: external_exports.array(external_exports.object({
+    collectionId: identifierSchema,
+    sourceId: identifierSchema,
+    flags: external_exports.array(identifierSchema).max(100)
+  })).max(1e4).default([]),
   excludeSourceIds: external_exports.array(external_exports.string().trim().min(1).max(500)).max(1e4).optional(),
   query: external_exports.string().trim().min(1).max(12e3),
   vectorEnabled: external_exports.boolean().default(true),
@@ -15740,7 +15771,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 }
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "1.2.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "2.0.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -16665,6 +16696,20 @@ async function runEndpointChain(options) {
   };
 }
 
+// src/shared/recall-scoring.ts
+function enhancedRecallScore(raw, document, sources = [], flags = [], assignments = []) {
+  const source = sources.find((item) => item.collectionId === document.collectionId);
+  let additive = source?.addWeight ?? 0;
+  let multiplier = source?.weight || 1;
+  const ids = new Set(assignments.find((item) => item.collectionId === document.collectionId && item.sourceId === document.sourceId)?.flags ?? []);
+  for (const flag of flags) {
+    if (!ids.has(flag.id)) continue;
+    additive += flag.addWeight;
+    multiplier *= flag.multiplyWeight || 1;
+  }
+  return (raw + additive) * multiplier;
+}
+
 // src/server/retrieval/fusion.ts
 function sourcePreference(document, sourceWeights = []) {
   const configured = sourceWeights.find((source) => source.collectionId === document.collectionId);
@@ -16696,10 +16741,10 @@ function reciprocalRankFusion(vectorResults, bm25Results, options = {}) {
   add(bm25Results, "bm25");
   return [...hits.values()].map((hit) => ({
     ...hit,
-    weightedScore: hit.rrfScore * (hit.sourceWeight ?? 1)
+    weightedScore: enhancedRecallScore(hit.rrfScore, hit.document, options.sourceWeights, options.flagRules, options.flagAssignments)
   })).sort((left, right) => (right.weightedScore ?? 0) - (left.weightedScore ?? 0) || right.rrfScore - left.rrfScore || (left.sourceOrder ?? Number.MAX_SAFE_INTEGER) - (right.sourceOrder ?? Number.MAX_SAFE_INTEGER) || left.document.documentId.localeCompare(right.document.documentId)).slice(0, limit);
 }
-function applyRerankScores(hits, scores, limit) {
+function applyRerankScores(hits, scores, limit, options = {}) {
   const seen = /* @__PURE__ */ new Set();
   const reranked = [];
   for (const result of [...scores].sort((left, right) => right.relevanceScore - left.relevanceScore || left.index - right.index)) {
@@ -16709,14 +16754,22 @@ function applyRerankScores(hits, scores, limit) {
     reranked.push({
       ...hits[result.index],
       rerankScore: result.relevanceScore,
-      rerankRank: reranked.length
+      weightedScore: enhancedRecallScore(
+        result.relevanceScore,
+        hits[result.index].document,
+        options.sourceWeights ?? [{
+          collectionId: hits[result.index].document.collectionId,
+          weight: hits[result.index].sourceWeight ?? 0,
+          order: hits[result.index].sourceOrder ?? 0
+        }],
+        options.flagRules,
+        options.flagAssignments
+      )
     });
   }
-  const remaining = hits.map((hit, index) => ({ hit, index })).filter(({ index }) => !seen.has(index)).map(({ hit }, index) => ({ ...hit, rerankRank: reranked.length + index }));
-  return [...reranked, ...remaining].map(({ rerankRank, ...hit }) => ({
-    ...hit,
-    weightedScore: (hit.sourceWeight ?? 1) / (rerankRank + 1)
-  })).sort((left, right) => (right.weightedScore ?? 0) - (left.weightedScore ?? 0) || (right.rerankScore ?? Number.NEGATIVE_INFINITY) - (left.rerankScore ?? Number.NEGATIVE_INFINITY) || (left.sourceOrder ?? Number.MAX_SAFE_INTEGER) - (right.sourceOrder ?? Number.MAX_SAFE_INTEGER) || left.document.documentId.localeCompare(right.document.documentId)).slice(0, limit);
+  const remaining = hits.map((hit, index) => ({ hit, index })).filter(({ index }) => !seen.has(index)).map(({ hit }) => hit);
+  reranked.sort((left, right) => (right.weightedScore ?? 0) - (left.weightedScore ?? 0) || (right.rerankScore ?? Number.NEGATIVE_INFINITY) - (left.rerankScore ?? Number.NEGATIVE_INFINITY) || (left.sourceOrder ?? Number.MAX_SAFE_INTEGER) - (right.sourceOrder ?? Number.MAX_SAFE_INTEGER) || left.document.documentId.localeCompare(right.document.documentId));
+  return [...reranked, ...remaining].slice(0, limit);
 }
 
 // src/server/security/abort-signal.ts
@@ -17459,7 +17512,11 @@ var RetrievalService = class {
     };
     if (previousStatus) rerankStatus = this.mergeBranchStatus(previousStatus, rerankStatus);
     if (rerank.state === "succeeded" && rerank.value) {
-      const hits = applyRerankScores(fusedHits, rerank.value, request.finalTopK);
+      const hits = applyRerankScores(fusedHits, rerank.value, fusedHits.length, {
+        ...request.sourceWeights ? { sourceWeights: request.sourceWeights } : {},
+        ...request.flagRules ? { flagRules: request.flagRules } : {},
+        ...request.flagAssignments ? { flagAssignments: request.flagAssignments } : {}
+      });
       return this.result(request, hits, vector, bm25, rerankStatus);
     }
     if (rerank.decisionRequired) {
@@ -17482,7 +17539,7 @@ var RetrievalService = class {
   }
   result(request, hits, vector, bm25, rerank, optional2 = {}) {
     return {
-      hits: hits.slice(0, request.finalTopK),
+      hits: hits.filter((hit) => (request.minimumRelevance ?? 0) === 0 || (hit.weightedScore ?? hit.rrfScore) >= request.minimumRelevance).slice(0, request.finalTopK),
       branches: { vector: vector.status, bm25: bm25.status, rerank },
       ...optional2
     };
@@ -17491,7 +17548,9 @@ var RetrievalService = class {
     return reciprocalRankFusion(vector, bm25, {
       k: 60,
       limit: Math.max(request.finalTopK, request.rerankTopK),
-      ...request.sourceWeights ? { sourceWeights: request.sourceWeights } : {}
+      ...request.sourceWeights ? { sourceWeights: request.sourceWeights } : {},
+      ...request.flagRules ? { flagRules: request.flagRules } : {},
+      ...request.flagAssignments ? { flagAssignments: request.flagAssignments } : {}
     });
   }
   withoutCredentials(request) {
