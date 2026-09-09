@@ -15771,7 +15771,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 }
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "2.0.1", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "2.0.2", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -19758,12 +19758,24 @@ var STATUS_OUTPUT_PROTOCOL = `You MUST output both sections in this exact order:
 <thinking>Your step-by-step state comparison, routing, cleanup, and final verification</thinking>
 {"operations":[{"op":"set","path":["category","field"],"value":"new value"},{"op":"delete","path":["category","obsolete field"]}]}
 Use only set and delete operations. Return {"operations":[]} when nothing changed. The JSON must appear after </thinking>. Do not include any other text.`;
+function unwrapStatusFence(value) {
+  return value.match(/^```(?:json|xml|text)?\s*\n([\s\S]*?)\n```\s*$/i)?.[1]?.trim() ?? value;
+}
 function parseStatusProviderOutput(raw) {
-  const match = raw.trim().match(/^<thinking>\s*([\s\S]+?)\s*<\/thinking>\s*([\s\S]+)$/i);
-  if (!match?.[1]?.trim() || !match[2]?.trim()) {
-    throw new Error("Status response must contain non-empty <thinking> followed by one JSON object.");
+  let content = unwrapStatusFence(raw.trim());
+  const thinking = content.match(/^<(thinking|think)>\s*[\s\S]*?<\/\1>\s*/i);
+  if (thinking) content = content.slice(thinking[0].length).trim();
+  if (/^<\/?(?:thinking|think)\b/i.test(content)) {
+    throw new Error("\u72B6\u6001\u54CD\u5E94\u7684 thinking/think \u6807\u7B7E\u672A\u95ED\u5408\u6216\u7ED3\u6784\u4E0D\u5B8C\u6574\uFF0C\u672A\u4FEE\u6539\u72B6\u6001\u3002");
   }
-  return statusProviderPayloadSchema.parse(parseProviderJsonObject(match[2]));
+  content = unwrapStatusFence(content);
+  let payload;
+  try {
+    payload = JSON.parse(content);
+  } catch {
+    throw new Error("\u72B6\u6001\u54CD\u5E94\u5FC5\u987B\u5305\u542B\u4E00\u4E2A\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u6B63\u6587\u53EF\u80FD\u5DF2\u622A\u65AD\u3001\u5305\u542B\u989D\u5916\u6587\u5B57\u6216\u591A\u4E2A\u5BF9\u8C61\uFF0C\u672A\u4FEE\u6539\u72B6\u6001\u3002");
+  }
+  return statusProviderPayloadSchema.parse(payload);
 }
 var StatusService = class {
   constructor(generation) {
