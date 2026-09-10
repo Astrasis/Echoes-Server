@@ -15771,7 +15771,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 }
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "2.0.2", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "2.0.3", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
