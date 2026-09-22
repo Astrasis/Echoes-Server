@@ -14670,6 +14670,264 @@ var memoryLinkSchema = external_exports.object({
   enabled: external_exports.boolean()
 }).strict();
 
+// src/shared/status-variables.ts
+var partNames = { base: "\u57FA\u7840\u503C", extra: "\u989D\u5916\u503C", final: "\u6700\u7EC8\u503C" };
+var precedence = /* @__PURE__ */ new Map([["+", 10], ["-", 10], ["*", 20], ["/", 20], ["%", 20], ["^", 30], ["**", 30]]);
+var functions = /* @__PURE__ */ new Map([
+  ["abs", { min: 1, max: 1, run: Math.abs }],
+  ["floor", { min: 1, max: 1, run: Math.floor }],
+  ["ceil", { min: 1, max: 1, run: Math.ceil }],
+  ["round", { min: 1, max: 1, run: Math.round }],
+  ["sqrt", { min: 1, max: 1, run: Math.sqrt }],
+  ["min", { min: 1, max: 32, run: Math.min }],
+  ["max", { min: 1, max: 32, run: Math.max }]
+]);
+function finite(value) {
+  if (!Number.isFinite(value)) throw new Error("\u8BA1\u7B97\u7ED3\u679C\u5FC5\u987B\u4E3A\u6709\u9650\u6570\u503C\uFF0C\u8BF7\u68C0\u67E5\u6EA2\u51FA\u6216\u51FD\u6570\u53C2\u6570\u3002");
+  return Object.is(value, -0) ? 0 : value;
+}
+var FormulaParser = class {
+  constructor(source) {
+    this.source = source;
+    if (!source.trim() || source.length > 4e3) throw new Error("\u516C\u5F0F\u4E0D\u80FD\u4E3A\u7A7A\uFF0C\u4E14\u4E0D\u80FD\u8D85\u8FC7 4000 \u4E2A\u5B57\u7B26\u3002");
+    const leading = source.match(/^\s*=/);
+    if (leading) this.index = leading[0].length;
+    this.token = this.next();
+  }
+  source;
+  index = 0;
+  nodes = 0;
+  token;
+  parse() {
+    const result = this.expression(0, 0);
+    if (this.token.kind !== "end") throw new Error(`\u516C\u5F0F\u7B2C ${this.token.start + 1} \u4E2A\u5B57\u7B26\u9644\u8FD1\u6709\u591A\u4F59\u5185\u5BB9\u3002`);
+    return result;
+  }
+  next() {
+    while (/\s/u.test(this.source[this.index] ?? "") && this.index < this.source.length) this.index++;
+    const start = this.index;
+    const rest = this.source.slice(start);
+    if (!rest) return { kind: "end", text: "", start, end: start };
+    const number4 = rest.match(/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/);
+    const name = rest.match(/^[A-Za-z_][A-Za-z0-9_]*/);
+    const string4 = rest.match(/^"(?:[^"\\\r\n]|\\.)*"/u);
+    const text = number4?.[0] ?? string4?.[0] ?? name?.[0] ?? (rest.startsWith("**") ? "**" : rest[0]);
+    if (!number4 && !name && !string4 && !["+", "-", "*", "/", "%", "^", "**", "(", ")", ","].includes(text)) {
+      throw new Error(`\u516C\u5F0F\u7B2C ${start + 1} \u4E2A\u5B57\u7B26\u65E0\u6548\uFF1B\u53D8\u91CF\u5F15\u7528\u4F7F\u7528 base("\u53D8\u91CF\u540D") \u6216 final("\u53D8\u91CF\u540D")\u3002`);
+    }
+    this.index += text.length;
+    return { kind: number4 ? "number" : string4 ? "string" : name ? "name" : "symbol", text, start, end: this.index };
+  }
+  take() {
+    const token = this.token;
+    this.token = this.next();
+    return token;
+  }
+  require(text) {
+    if (this.token.text !== text) throw new Error(`\u516C\u5F0F\u7B2C ${this.token.start + 1} \u4E2A\u5B57\u7B26\u5904\u5E94\u4E3A ${text}\u3002`);
+    this.take();
+  }
+  expression(minimum, depth) {
+    if (depth > 64 || ++this.nodes > 512) throw new Error("\u516C\u5F0F\u8FC7\u4E8E\u590D\u6742\uFF0C\u8BF7\u51CF\u5C11\u5D4C\u5957\u548C\u8FD0\u7B97\u9879\u3002");
+    const token = this.take();
+    let left;
+    if (token.kind === "number") left = { kind: "number", value: finite(Number(token.text)) };
+    else if (token.text === "+" || token.text === "-") {
+      left = { kind: "unary", operator: token.text, value: this.expression(25, depth + 1) };
+    } else if (token.text === "(") {
+      left = this.expression(0, depth + 1);
+      this.require(")");
+    } else if (token.kind === "name") {
+      this.require("(");
+      if (token.text === "base" || token.text === "final") {
+        const name = this.take();
+        if (name.kind !== "string") throw new Error('\u53D8\u91CF\u540D\u5FC5\u987B\u653E\u5728\u53CC\u5F15\u53F7\u5185\uFF0C\u4F8B\u5982 base("STR")\u3002');
+        let value;
+        try {
+          value = JSON.parse(name.text);
+        } catch {
+          throw new Error("\u53D8\u91CF\u5F15\u7528\u4E2D\u7684\u53CC\u5F15\u53F7\u6216\u8F6C\u4E49\u5B57\u7B26\u65E0\u6548\u3002");
+        }
+        if (typeof value !== "string" || !value) throw new Error("\u53D8\u91CF\u5F15\u7528\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A\u3002");
+        this.require(")");
+        left = { kind: "reference", name: value, part: token.text, start: name.start, end: name.end };
+      } else {
+        const fn = functions.get(token.text);
+        if (!fn) throw new Error(`\u4E0D\u652F\u6301\u51FD\u6570 ${token.text}\u3002`);
+        const args = [];
+        if (this.token.text !== ")") {
+          do {
+            if (args.length) this.require(",");
+            args.push(this.expression(0, depth + 1));
+          } while (this.token.text === "," && args.length <= fn.max);
+        }
+        this.require(")");
+        if (args.length < fn.min || args.length > fn.max) throw new Error(`\u51FD\u6570 ${token.text} \u7684\u53C2\u6570\u6570\u91CF\u4E0D\u6B63\u786E\u3002`);
+        left = { kind: "call", name: token.text, arguments: args };
+      }
+    } else throw new Error(`\u516C\u5F0F\u7B2C ${token.start + 1} \u4E2A\u5B57\u7B26\u5904\u7F3A\u5C11\u6570\u503C\u6216\u53D8\u91CF\u5F15\u7528\u3002`);
+    while (this.token.kind === "symbol") {
+      const level = precedence.get(this.token.text);
+      if (level === void 0 || level < minimum) break;
+      if (++this.nodes > 512) throw new Error("\u516C\u5F0F\u8FC7\u4E8E\u590D\u6742\uFF0C\u8BF7\u51CF\u5C11\u8FD0\u7B97\u9879\u3002");
+      const operator = this.take().text;
+      const right = this.expression(level + (level === 30 ? 0 : 1), depth + 1);
+      left = { kind: "binary", operator, left, right };
+    }
+    return left;
+  }
+};
+function references(expression) {
+  switch (expression.kind) {
+    case "reference":
+      return [expression];
+    case "unary":
+      return references(expression.value);
+    case "binary":
+      return [...references(expression.left), ...references(expression.right)];
+    case "call":
+      return expression.arguments.flatMap(references);
+    default:
+      return [];
+  }
+}
+function evaluate(expression, resolve) {
+  switch (expression.kind) {
+    case "number":
+      return expression.value;
+    case "reference":
+      return resolve(expression);
+    case "unary":
+      return finite((expression.operator === "-" ? -1 : 1) * evaluate(expression.value, resolve));
+    case "call":
+      return finite(functions.get(expression.name).run(...expression.arguments.map((arg) => evaluate(arg, resolve))));
+    case "binary": {
+      const a = evaluate(expression.left, resolve), b = evaluate(expression.right, resolve);
+      if ((expression.operator === "/" || expression.operator === "%") && b === 0) throw new Error("\u516C\u5F0F\u4E0D\u80FD\u9664\u4EE5\u96F6\u6216\u5BF9\u96F6\u53D6\u4F59\u3002");
+      switch (expression.operator) {
+        case "+":
+          return finite(a + b);
+        case "-":
+          return finite(a - b);
+        case "*":
+          return finite(a * b);
+        case "/":
+          return finite(a / b);
+        case "%":
+          return finite(a % b);
+        default:
+          return finite(a ** b);
+      }
+    }
+  }
+}
+var operandSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({ kind: external_exports.literal("number"), value: external_exports.number().finite() }).strict(),
+  external_exports.object({ kind: external_exports.literal("formula"), value: external_exports.string().min(1).max(4e3) }).strict()
+]);
+var variableSchema = external_exports.object({
+  id: external_exports.string().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
+  name: external_exports.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f\u2028\u2029]+$/u, "\u53D8\u91CF\u540D\u5FC5\u987B\u4E3A\u5355\u884C\u6587\u672C\u3002"),
+  type: external_exports.enum(["fixed", "computed"]),
+  base: operandSchema,
+  extra: operandSchema
+}).strict().refine((variable) => variable.base.kind === (variable.type === "fixed" ? "number" : "formula"), {
+  message: "\u56FA\u5B9A\u53D8\u91CF\u7684\u57FA\u7840\u503C\u5FC5\u987B\u4E3A\u6570\u503C\uFF0C\u53D8\u5316\u53D8\u91CF\u7684\u57FA\u7840\u503C\u5FC5\u987B\u4E3A\u516C\u5F0F\u3002"
+});
+var listSchema = external_exports.array(variableSchema).max(500);
+function calculate(variables) {
+  const byName = /* @__PURE__ */ new Map();
+  const ids = /* @__PURE__ */ new Set();
+  for (const variable of variables) {
+    if (byName.has(variable.name)) throw new Error(`\u53D8\u91CF\u540D\u91CD\u590D\uFF1A${variable.name}\u3002`);
+    if (ids.has(variable.id)) throw new Error("\u53D8\u91CF\u6807\u8BC6\u91CD\u590D\u3002");
+    byName.set(variable.name, variable);
+    ids.add(variable.id);
+  }
+  const nodes = /* @__PURE__ */ new Map();
+  const key = (variable, part) => `${variable.id}:${part}`;
+  for (const variable of variables) {
+    for (const part of ["base", "extra"]) {
+      try {
+        const operand = variable[part];
+        const expression = operand.kind === "number" ? { kind: "number", value: operand.value } : new FormulaParser(operand.value).parse();
+        const dependencies = new Set(references(expression).map((ref) => {
+          const target = byName.get(ref.name);
+          if (!target) throw new Error(`\u5F15\u7528\u7684\u53D8\u91CF\u201C${ref.name}\u201D\u4E0D\u5B58\u5728\uFF1B\u8BF7\u5148\u4FEE\u6539\u5F15\u7528\u5B83\u7684\u516C\u5F0F\u3002`);
+          if (target.id === variable.id) throw new Error("\u4E0D\u80FD\u5F15\u7528\u672C\u53D8\u91CF\u7684\u57FA\u7840\u503C\u6216\u6700\u7EC8\u503C\u3002");
+          if (target.type !== "fixed") throw new Error(`\u53EA\u80FD\u5F15\u7528\u56FA\u5B9A\u53D8\u91CF\uFF0C\u201C${ref.name}\u201D\u662F\u53D8\u5316\u53D8\u91CF\u3002`);
+          return key(target, ref.part);
+        }));
+        nodes.set(key(variable, part), { variable, part, expression, dependencies });
+      } catch (error51) {
+        throw new Error(`${variable.name} \xB7 ${partNames[part]}\uFF1A${error51 instanceof Error ? error51.message : String(error51)}`);
+      }
+    }
+    nodes.set(key(variable, "final"), {
+      variable,
+      part: "final",
+      dependencies: /* @__PURE__ */ new Set([key(variable, "base"), key(variable, "extra")])
+    });
+  }
+  const pending = /* @__PURE__ */ new Map(), dependents = /* @__PURE__ */ new Map();
+  const ready = [], order = [];
+  for (const [id, node] of nodes) {
+    pending.set(id, node.dependencies.size);
+    if (!node.dependencies.size) ready.push(id);
+    for (const dependency of node.dependencies) {
+      const list = dependents.get(dependency) ?? [];
+      list.push(id);
+      dependents.set(dependency, list);
+    }
+  }
+  for (let index = 0; index < ready.length; index++) {
+    const id = ready[index];
+    order.push(id);
+    for (const child of dependents.get(id) ?? []) {
+      const remaining = pending.get(child) - 1;
+      pending.set(child, remaining);
+      if (!remaining) ready.push(child);
+    }
+  }
+  if (order.length !== nodes.size) {
+    let next = [...pending].find(([, remaining]) => remaining > 0)[0];
+    const path6 = [];
+    while (!path6.includes(next)) {
+      path6.push(next);
+      next = [...nodes.get(next).dependencies].find((dependency) => pending.get(dependency) > 0);
+    }
+    const cycle = [...path6.slice(path6.indexOf(next)), next].map((id) => {
+      const node = nodes.get(id);
+      return `${node.variable.name}.${partNames[node.part]}`;
+    });
+    throw new Error(`\u516C\u5F0F\u5FAA\u73AF\uFF1A${cycle.join(" \u2192 ")}\u3002\u672A\u4FDD\u5B58\u672C\u6B21\u4FEE\u6539\u3002`);
+  }
+  const values = /* @__PURE__ */ new Map();
+  for (const id of order) {
+    const node = nodes.get(id);
+    try {
+      const value = node.part === "final" ? finite(values.get(key(node.variable, "base")) + values.get(key(node.variable, "extra"))) : evaluate(node.expression, (ref) => values.get(key(byName.get(ref.name), ref.part)));
+      values.set(id, finite(value));
+    } catch (error51) {
+      throw new Error(`${node.variable.name} \xB7 ${partNames[node.part]}\uFF1A${error51 instanceof Error ? error51.message : String(error51)}`);
+    }
+  }
+  return variables.map((variable) => ({
+    id: variable.id,
+    name: variable.name,
+    base: values.get(key(variable, "base")),
+    extra: values.get(key(variable, "extra")),
+    final: values.get(key(variable, "final"))
+  }));
+}
+var statusVariablesSchema = listSchema.superRefine((variables, ctx) => {
+  try {
+    calculate(variables);
+  } catch (error51) {
+    ctx.addIssue({ code: "custom", message: error51 instanceof Error ? error51.message : String(error51) });
+  }
+});
+
 // src/shared/domain.ts
 var MEMORY_COLUMN_TYPES = [
   "text",
@@ -15147,6 +15405,8 @@ var summarySliceCandidateSchema = external_exports.object({
   tags: external_exports.array(external_exports.string().trim().min(1).max(200)).max(100).default([])
 }).strict();
 var summaryBatchMetadataSchema = summaryBatchInputSchema.extend({
+  // Logical batches may span multiple requests, each still limited to 500 messages.
+  messageIds: external_exports.array(external_exports.string().min(1).max(240)).min(1).max(5e4),
   source: external_exports.discriminatedUnion("kind", [
     external_exports.object({ kind: external_exports.literal("chat_messages") }).strict(),
     external_exports.object({
@@ -15233,6 +15493,7 @@ var summaryCatalogSchema = external_exports.object({
   }),
   nextBatchNumber: external_exports.number().int().min(1),
   lastCommittedMessageId: external_exports.string().max(240).optional(),
+  checkpointAnchorMessageId: external_exports.string().max(240).optional(),
   retrievalCollectionId: identifierSchema.optional(),
   retrievalEmbeddingSpaceId: identifierSchema.optional(),
   pendingRetrievalDeletes: external_exports.array(identifierSchema).max(1e4).default([]),
@@ -15595,6 +15856,7 @@ var statusCatalogSchema = external_exports.object({
   enabled: external_exports.boolean().default(false),
   autoUpdate: external_exports.boolean().default(false),
   profile: statusProfileSchema,
+  customVariables: statusVariablesSchema.default([]),
   updatedAt: external_exports.string().datetime()
 }).strict();
 var statusSnapshotSchema = external_exports.object({
@@ -15951,7 +16213,7 @@ function validateMemoryValues(columns, rawValues, options = {}) {
 }
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.0.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.1.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -17216,6 +17478,33 @@ async function readResponseTextLimited(response, limit = MAX_PROVIDER_RESPONSE_B
   return text;
 }
 
+// src/server/providers/provider-error.ts
+function redact(value, secrets) {
+  for (const secret of secrets.filter(Boolean)) value = value.replaceAll(secret, "[REDACTED]");
+  return value.replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]").replace(/sk-[a-zA-Z0-9_-]+/g, "[REDACTED]").replace(/((?:api[_-]?key|authorization|password|secret|access[_-]?token)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;<>]+)/gi, "$1[REDACTED]");
+}
+function providerHttpErrorMessage(status, raw, secrets = [], requestId) {
+  let detail = "";
+  try {
+    const payload = JSON.parse(raw);
+    const source = typeof payload?.error === "object" && payload.error !== null ? payload.error : payload;
+    const fields = [
+      typeof payload?.error === "string" ? payload.error : source?.message,
+      source?.code,
+      source?.type,
+      source?.param,
+      source?.path,
+      payload?.request_id ?? payload?.requestId
+    ];
+    detail = fields.flatMap((value) => typeof value === "string" || typeof value === "number" ? [String(value)] : Array.isArray(value) ? [value.join(".")] : []).join(" \xB7 ");
+  } catch {
+    detail = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  }
+  if (requestId) detail += `${detail ? " \xB7 " : ""}request_id=${requestId}`;
+  detail = redact(detail, secrets).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1500);
+  return `Provider returned HTTP ${status}${detail ? `: ${detail}` : "."}`;
+}
+
 // src/server/retrieval/retrieval-provider.ts
 var MAX_EMBEDDING_RESPONSE_BYTES = 256 * 1024 * 1024;
 function embeddingUrl(baseUrl) {
@@ -17224,23 +17513,8 @@ function embeddingUrl(baseUrl) {
   if (/\/v1$/i.test(normalized)) return `${normalized}/embeddings`;
   return `${normalized}/v1/embeddings`;
 }
-function providerErrorDetail(raw) {
-  try {
-    const payload = JSON.parse(raw);
-    const source = typeof payload.error === "string" ? { message: payload.error } : payload.error ?? payload;
-    const parts = [
-      typeof source.message === "string" ? source.message.trim() : "",
-      typeof source.code === "string" ? source.code.trim() : "",
-      typeof source.type === "string" ? source.type.trim() : ""
-    ].filter(Boolean);
-    return parts.join(" \xB7 ").slice(0, 500);
-  } catch {
-    return "";
-  }
-}
-function statusError(status, raw) {
-  const detail = providerErrorDetail(raw);
-  return new RetrievalProviderError(`Provider returned HTTP ${status}${detail ? `: ${detail}` : "."}`, {
+function statusError(status, raw, apiKey, requestId) {
+  return new RetrievalProviderError(providerHttpErrorMessage(status, raw, [apiKey], requestId), {
     ambiguous: status === 504,
     status,
     code: `PROVIDER_HTTP_${status}`
@@ -17275,7 +17549,7 @@ async function providerJson(options) {
       response,
       response.ok ? options.maxResponseBytes : MAX_PROVIDER_ERROR_BYTES
     );
-    if (!response.ok) throw statusError(response.status, text);
+    if (!response.ok) throw statusError(response.status, text, options.endpoint.apiKey ?? "", response.headers.get("x-request-id"));
     try {
       const payload = JSON.parse(text);
       activeTaskBudget.getStore()?.record(payload);
@@ -17502,6 +17776,7 @@ var RetrievalService = class {
     let vectorized = 0;
     let failed = 0;
     let ambiguous = 0;
+    let pending = documents.length;
     const attempts = [];
     let decisionRequired;
     const embeddingBatchSize = Math.max(1, Math.min(100, request.embeddingBatchSize ?? 10));
@@ -17529,6 +17804,7 @@ var RetrievalService = class {
       });
       attempts.push(...result.attempts.slice(-10));
       const documentIds = batch.map((document) => document.documentId);
+      pending -= documentIds.length;
       if (result.state === "succeeded" && result.value) {
         await this.store.upsertVectors({
           embeddingSpaceId: request.embeddingGroup.embeddingSpaceId,
@@ -17545,12 +17821,16 @@ var RetrievalService = class {
       if (state === "ambiguous") ambiguous += documentIds.length;
       else failed += documentIds.length;
       decisionRequired ??= result.decisionRequired;
+      if (state === "ambiguous") {
+        await this.store.markVectorState(documents.slice(offset + batch.length).map((document) => document.documentId), "pending");
+        break;
+      }
     }
     base.attempts = attempts;
     return {
       ...base,
       vectorized,
-      pending: 0,
+      pending,
       failed,
       ambiguous,
       ...decisionRequired ? { decisionRequired } : {}
@@ -19230,13 +19510,13 @@ function extractionProviderMessages(request) {
 }
 function extractionRowReferences(rows) {
   const storedIds = new Set(rows.map((row) => row.id));
-  const references = /* @__PURE__ */ new Map();
+  const references2 = /* @__PURE__ */ new Map();
   let index = 1;
   for (const row of rows) {
     while (storedIds.has(`R${index}`)) index += 1;
-    references.set(`R${index++}`, row.id);
+    references2.set(`R${index++}`, row.id);
   }
-  return references;
+  return references2;
 }
 function extractionRuntimeInput(request) {
   const referenceById = new Map([...extractionRowReferences(request.rows)].map(([ref, id]) => [id, ref]));
@@ -19383,7 +19663,12 @@ async function requestModelCatalog(options) {
       allowPrivateNetwork: options.config.allowPrivateNetwork === true
     });
     const raw = await readResponseTextLimited(response, 4 * 1024 * 1024);
-    if (!response.ok) throw new ProviderCallError(`Provider model list returned HTTP ${response.status}.`, response.status, false);
+    if (!response.ok) throw new ProviderCallError(providerHttpErrorMessage(
+      response.status,
+      raw,
+      [options.config.apiKey ?? ""],
+      response.headers.get("x-request-id")
+    ), response.status, false, response.status === 504);
     try {
       return parseModelCatalog(JSON.parse(raw));
     } catch (error51) {
@@ -19463,15 +19748,16 @@ async function requestStructuredCompletion(options) {
       allowPrivateNetwork: config2.allowPrivateNetwork === true
     });
     if (!response.ok) {
-      await readResponseTextLimited(response, 64 * 1024);
+      const raw = await readResponseTextLimited(response, 64 * 1024);
+      const message = providerHttpErrorMessage(response.status, raw, [config2.apiKey ?? ""], response.headers.get("x-request-id"));
       if (response.status === 504) {
         throw new RetrievalProviderError(
-          "Provider returned HTTP 504 after accepting the request. It may still have completed and billed it.",
+          `${message} The request may still have completed and been billed.`,
           { ambiguous: true, status: 504, code: "PROVIDER_HTTP_504" }
         );
       }
       throw new ProviderCallError(
-        `Provider returned HTTP ${response.status}.`,
+        message,
         response.status,
         response.status === 408 || response.status === 429 || response.status >= 500
       );
