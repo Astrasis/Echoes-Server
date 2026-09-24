@@ -761,9 +761,9 @@ function floatSafeRemainder(val, step) {
   return ratio - roundedRatio;
 }
 var EVALUATING = /* @__PURE__ */ Symbol("evaluating");
-function defineLazy(object2, key, getter) {
+function defineLazy(object3, key, getter) {
   let value = void 0;
-  Object.defineProperty(object2, key, {
+  Object.defineProperty(object3, key, {
     get() {
       if (value === EVALUATING) {
         return void 0;
@@ -775,7 +775,7 @@ function defineLazy(object2, key, getter) {
       return value;
     },
     set(v) {
-      Object.defineProperty(object2, key, {
+      Object.defineProperty(object3, key, {
         value: v
         // configurable: true,
       });
@@ -14605,7 +14605,20 @@ var continuitySettingsSchema = external_exports.object({
   }).default({ auto: false, maxRequests: 1, maxWaitMs: 15e3, maxItems: 3, minimumHits: 2, allowPaid: false })
 });
 var DEFAULT_CONTINUITY = continuitySettingsSchema.parse({});
-var CONTINUITY_EXTRACTION_GUIDE = `Optional temporal and knowledge attributes are enabled. Use Chinese natural-language values. Preserve the original independent timestamp and complete narrative content. You may additionally return "continuity": {"eventTime":"YYYY[-MM[-DD[THH]]] | unknown","learnedTime":"same time format","validFrom":"same time format","validUntil":"same time format","validity":"current | historical | superseded","changeKind":"fact_change | knowledge_change | canon_correction | unclassified","note":"uncertainty or scope","knowledge":[{"character":"exact character name","state":"known | believed | suspected | misunderstood | unknown","claim":"specific proposition","learnedTime":"optional supported time"}]}. All fields are optional. Only use supported dates; omit unknown attributes rather than inventing precision. Knowledge states refer to specific claims, not the entire scene. Preserve uncertainty; a later discovery is not earlier knowledge. Omission does not change existing attributes or default character-known rules. Distinguish an actual change from a correction to a previously erroneous record. Use superseded only if the entire record is invalidated. No conflict-priority rules or evidenceMessageIds.`;
+var CONTINUITY_EXTRACTION_GUIDE = `Optional temporal and knowledge attributes are enabled. Preserve the independent timestamp and complete narrative content. Each record may include an optional continuity object; every field inside it is optional.
+
+Use Chinese for character, claim and note. Field names and the following enum codes must remain in English. Choose ONE code, not a combined list or a translated label:
+- changeKind: fact_change (\u4E8B\u5B9E\u53D1\u751F\u53D8\u5316), knowledge_change (\u89D2\u8272\u8BA4\u77E5\u53D8\u5316), canon_correction (\u66F4\u6B63\u65E7\u8BBE\u5B9A), unclassified (\u672A\u5206\u7C7B).
+- validity: current (\u5F53\u524D\u6709\u6548), historical (\u5386\u53F2\u7ECF\u5386), superseded (\u5DF2\u88AB\u66F4\u6B63\u5931\u6548).
+- knowledge[].state: known (\u5DF2\u77E5), believed (\u76F8\u4FE1), suspected (\u6000\u7591), misunderstood (\u8BEF\u89E3), unknown (\u672A\u77E5).
+Use unclassified or omit changeKind when no classification is supported. An event type such as relationship, plan or discovery is not a changeKind code.
+
+eventTime, learnedTime, validFrom, validUntil and knowledge[].learnedTime use the same single-time formats: YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH, or unknown. For example "2087-04-09T16" is valid. Keep ranges and approximate qualifiers in note or content. Only use supported dates; omit unknown attributes rather than inventing precision.
+
+Fictional format example, not source facts:
+{"continuity":{"eventTime":"2087-04","changeKind":"knowledge_change","knowledge":[{"character":"\u6D1B\u79BE","state":"suspected","claim":"\u7F57\u76D8\u7684\u5C01\u6761\u53EF\u80FD\u88AB\u66F4\u6362"}]}}
+
+Knowledge states refer to specific claims, not the entire scene. Preserve uncertainty; a later discovery is not earlier knowledge. Omission does not change existing attributes or default character-known rules. Distinguish an actual change from a correction to a previously erroneous record. Use superseded only if the entire record is invalidated. No conflict-priority rules or evidenceMessageIds.`;
 var memoryReferenceSchema = external_exports.object({ kind: external_exports.enum(["row", "summary"]), id: external_exports.string().min(1).max(240) }).strict();
 var memoryLinkSchema = external_exports.object({
   id: external_exports.string().min(1).max(240),
@@ -16272,7 +16285,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.2.1", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -16296,9 +16309,14 @@ function route(handler, allowIncompatible = false) {
       });
       return;
     }
-    void Promise.resolve().then(
-      () => requestBudget.run(taskBudgetSchema.parse(request.body?.taskBudget ?? {}), () => handler(request, response))
-    ).catch((error51) => {
+    void Promise.resolve().then(() => {
+      const budget = taskBudgetSchema.parse(request.body?.taskBudget ?? {});
+      if (request.body && typeof request.body === "object" && !Array.isArray(request.body)) {
+        const { taskBudget: _budget, ...body } = request.body;
+        request.body = body;
+      }
+      return requestBudget.run(budget, () => handler(request, response));
+    }).catch((error51) => {
       const message = error51 instanceof Error ? error51.message : String(error51);
       if (!response.headersSent) response.status(errorStatus(error51)).json({ error: message });
     });
@@ -20257,15 +20275,179 @@ async function sourceMessagesHash(messages) {
 }
 
 // src/shared/summary-protocol.ts
-var OUTPUT_PROTOCOL = `Return exactly one JSON object with this shape:
-{"summaries":[{"timestamp":"YYYY | YYYY-MM | YYYY-MM-DD | YYYY-MM-DDTHH | unknown","title":"short title","content":"self-contained factual summary in Chinese","tags":["entity or plot keyword"]}]}
-Every summary must have its own timestamp. Use unknown only when no in-universe year can be established. Produce between 1 and 50 summaries. Do not use Markdown fences or include any text outside the JSON object.`;
+var SUMMARY_OUTPUT_PROTOCOL = `Use Chinese for every title, content and tag. Return one complete JSON object containing a summaries array of 1 to 50 independently readable memories. Keep the narrative detail and coverage requested in the summary instructions.
+
+Each item has timestamp (string), title (string), content (string), and tags (string array).
+Each timestamp is ONE in-universe time: YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH, or unknown. Examples of valid values: "2087", "2087-04", "2087-04-09", "2087-04-09T16".
+Use zero-padded months, days and hours; T is the literal separator before the hour. Precision ends at the hour, without minutes, seconds or timezone. Use unknown only when no in-universe year can be established.
+For a continuous period, timestamp is its supported beginning or decisive change; preserve the complete period in content. Distinct events at different times remain distinct memories. Do not put ranges, alternatives, explanatory text or format placeholders in timestamp.
+
+Fictional format example only; never extract these example facts:
+{"summaries":[{"timestamp":"2087-04","title":"\u6D1B\u79BE\u6682\u5B58\u7F57\u76D8","content":"\u6D1B\u79BE\u5728\u6625\u5B63\u6D4B\u7ED8\u524D\u5C06\u65E7\u7F57\u76D8\u4EA4\u7ED9\u949F\u8868\u5320\u6E29\u781A\u4FDD\u7BA1\u3002\u6E29\u781A\u7B54\u5E94\u53EA\u68C0\u67E5\u5916\u58F3\uFF0C\u4E0D\u62C6\u5F00\u5185\u90E8\u9F7F\u8F6E\uFF1B\u53CC\u65B9\u5C1A\u672A\u7EA6\u5B9A\u53D6\u56DE\u65E5\u671F\u3002","tags":["\u6D1B\u79BE","\u6E29\u781A","\u65E7\u7F57\u76D8"]}]}
+
+JSON property names and enum codes remain in English; only natural-language values use Chinese. Return the final JSON directly, without Markdown fences, memory XML blocks, commentary or drafting notes.`;
 function summaryProviderMessages(request) {
   return [
     ...request.promptMessages,
     ...request.extractAttributes ? [{ role: "system", content: CONTINUITY_EXTRACTION_GUIDE }] : [],
-    { role: "user", content: OUTPUT_PROTOCOL + (request.extractAttributes ? "\nEach summary may additionally contain the optional continuity object described above." : "") }
+    { role: "user", content: SUMMARY_OUTPUT_PROTOCOL + (request.extractAttributes ? "\nEach summary may additionally contain the optional continuity object described above. Choose exactly one documented English code for each enum; these codes are not titles or tags." : "\nTemporal/knowledge attributes are disabled. Use only timestamp, title, content and tags; retain relevant uncertainty and attribution in content.") }
   ];
+}
+
+// src/server/services/summary-output.ts
+function object2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function unwrapFence(value) {
+  return value.match(/^```(?:json|text)?[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/i)?.[1]?.trim() ?? value;
+}
+function parseSummaryJson(raw) {
+  let content = unwrapFence(raw.trim());
+  const reasoning = content.match(/^<(thinking|think)>[\s\S]*?<\/\1>\s*/i);
+  if (reasoning) content = content.slice(reasoning[0].length).trim();
+  content = unwrapFence(content);
+  try {
+    const value = JSON.parse(content);
+    if (!object2(value)) throw new Error("Expected an object.");
+    return value;
+  } catch {
+    throw new Error("Summary response must be one complete JSON object. \u603B\u7ED3\u54CD\u5E94\u4E0D\u662F\u5B8C\u6574 JSON \u5BF9\u8C61\uFF0C\u53EF\u80FD\u88AB\u622A\u65AD\u3001\u542B\u989D\u5916\u6587\u5B57\u6216\u591A\u4E2A\u5BF9\u8C61\uFF1B\u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002\u5B8C\u6574\u7684\u4EE3\u7801\u56F4\u680F\u548C\u5DF2\u95ED\u5408\u7684 think/thinking \u524D\u7F00\u53EF\u81EA\u52A8\u5904\u7406\u3002");
+  }
+}
+function normalizeSingleTime(raw) {
+  if (summaryTimestampSchema.safeParse(raw).success) return { value: raw };
+  if (/^(?:unknown|未知|时间不明)$/i.test(raw)) return { value: "unknown" };
+  const chinese = /^(\d{4})年(?:(\d{1,2})月(?:(\d{1,2})日?(?:\s*(\d{1,2})(?:时|点)(?:(\d{1,2})分(?:(\d{1,2})秒)?)?)?)?)?$/.exec(raw);
+  const numeric = /^(\d{4})(?:[-/](\d{1,2})(?:[-/](\d{1,2})(?:[Tt ](\d{1,2})(?::(\d{2})(?::(\d{2})(?:\.\d+)?)?)?)?)?)?$/.exec(raw);
+  const match = chinese ?? numeric;
+  if (!match) return null;
+  if (match[5] !== void 0 && Number(match[5]) > 59 || match[6] !== void 0 && Number(match[6]) > 59) return null;
+  const value = match[1] + (match[2] === void 0 ? "" : `-${match[2].padStart(2, "0")}`) + (match[3] === void 0 ? "" : `-${match[3].padStart(2, "0")}`) + (match[4] === void 0 ? "" : `T${match[4].padStart(2, "0")}`);
+  if (!summaryTimestampSchema.safeParse(value).success) return null;
+  return { value, ...match[5] === void 0 ? {} : { detail: raw } };
+}
+function normalizeTime(raw, allowRange) {
+  const single = normalizeSingleTime(raw);
+  if (single || !allowRange) return single;
+  const parts = raw.split(/\s*(?:~|～|至|到|–|—)\s*|\s+-\s+/);
+  if (parts.length !== 2) return null;
+  const start = normalizeSingleTime(parts[0]);
+  const end = normalizeSingleTime(parts[1]);
+  if (!start || !end || start.value === "unknown" || end.value === "unknown") return null;
+  const precision = Math.min(start.value.length, end.value.length);
+  if (start.value.slice(0, precision) > end.value.slice(0, precision)) return null;
+  return { value: start.value, detail: raw };
+}
+var enumAliases = {
+  changeKind: {
+    fact_change: "fact_change",
+    knowledge_change: "knowledge_change",
+    canon_correction: "canon_correction",
+    unclassified: "unclassified",
+    \u4E8B\u5B9E\u53D8\u5316: "fact_change",
+    \u4E8B\u5B9E\u53D1\u751F\u53D8\u5316: "fact_change",
+    \u8BA4\u77E5\u53D8\u5316: "knowledge_change",
+    \u89D2\u8272\u8BA4\u77E5\u53D8\u5316: "knowledge_change",
+    \u8BBE\u5B9A\u66F4\u6B63: "canon_correction",
+    \u66F4\u6B63\u65E7\u8BBE\u5B9A: "canon_correction",
+    \u672A\u5206\u7C7B: "unclassified"
+  },
+  validity: {
+    current: "current",
+    historical: "historical",
+    superseded: "superseded",
+    \u5F53\u524D\u6709\u6548: "current",
+    \u5386\u53F2\u7ECF\u5386: "historical",
+    \u5DF2\u88AB\u66F4\u6B63\u5931\u6548: "superseded"
+  },
+  state: {
+    known: "known",
+    believed: "believed",
+    suspected: "suspected",
+    misunderstood: "misunderstood",
+    unknown: "unknown",
+    \u5DF2\u77E5: "known",
+    \u76F8\u4FE1: "believed",
+    \u6000\u7591: "suspected",
+    \u8BEF\u89E3: "misunderstood",
+    \u672A\u77E5: "unknown"
+  }
+};
+function parseSummaryOutput(raw) {
+  const payload = parseSummaryJson(raw);
+  let normalizedFields = 0;
+  if (object2(payload) && Array.isArray(payload.summaries)) {
+    for (const slice of payload.summaries) {
+      if (!object2(slice)) continue;
+      const timestamp = typeof slice.timestamp === "string" ? normalizeTime(slice.timestamp.trim(), true) : null;
+      if (timestamp && timestamp.value !== slice.timestamp) {
+        slice.timestamp = timestamp.value;
+        if (timestamp.detail && typeof slice.content === "string") {
+          slice.content += `
+\u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${timestamp.detail}`;
+        }
+        normalizedFields++;
+      }
+      if (!object2(slice.continuity)) continue;
+      const continuity = slice.continuity;
+      const notes = [];
+      const normalizeEnum = (target, field) => {
+        const value = target[field];
+        if (typeof value !== "string") return;
+        const key = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+        const aliases = enumAliases[field];
+        const mapped = aliases && Object.hasOwn(aliases, key) ? aliases[key] : void 0;
+        if (mapped !== void 0) {
+          if (mapped !== value) {
+            target[field] = mapped;
+            normalizedFields++;
+          }
+        } else if (field === "changeKind") {
+          target[field] = "unclassified";
+          notes.push(`\u6A21\u578B\u539F\u59CB\u53D8\u5316\u5206\u7C7B\uFF1A${value}`);
+          normalizedFields++;
+        }
+      };
+      const normalizeAttributeTime = (target, field) => {
+        if (typeof target[field] !== "string") return;
+        const rawTime = target[field];
+        const result2 = normalizeTime(rawTime.trim(), false);
+        if (result2 && result2.value !== rawTime) {
+          target[field] = result2.value;
+          if (result2.detail) notes.push(`${field} \u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${result2.detail}`);
+          normalizedFields++;
+        }
+      };
+      normalizeEnum(continuity, "changeKind");
+      normalizeEnum(continuity, "validity");
+      for (const field of ["eventTime", "learnedTime", "validFrom", "validUntil"]) normalizeAttributeTime(continuity, field);
+      if (Array.isArray(continuity.knowledge)) for (const knowledge of continuity.knowledge) {
+        if (!object2(knowledge)) continue;
+        normalizeEnum(knowledge, "state");
+        normalizeAttributeTime(knowledge, "learnedTime");
+      }
+      if (notes.length && (continuity.note === void 0 || typeof continuity.note === "string")) {
+        continuity.note = [continuity.note, ...notes].filter(Boolean).join("\n");
+      }
+    }
+  }
+  const result = summaryPayloadSchema.safeParse(payload);
+  if (!result.success) {
+    const issues = result.error.issues.slice(0, 10).map((issue2) => {
+      let value = payload;
+      for (const part of issue2.path) {
+        value = value !== null && typeof value === "object" ? Reflect.get(value, part) : void 0;
+      }
+      const field = issue2.path.at(-1);
+      const showValue = ["timestamp", "eventTime", "learnedTime", "validFrom", "validUntil", "changeKind", "validity", "state"].includes(String(field));
+      const actual = showValue ? ` (received ${JSON.stringify(value)?.slice(0, 160) ?? "undefined"})` : "";
+      return `${issue2.path.join(".")}: ${issue2.message}${actual}`;
+    });
+    throw new Error(`\u603B\u7ED3\u8F93\u51FA\u6821\u9A8C\u5931\u8D25\uFF1B\u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002
+${issues.join("\n")}` + (result.error.issues.length > 10 ? `
+\u53E6\u6709 ${result.error.issues.length - 10} \u9879\u6821\u9A8C\u9519\u8BEF\u3002` : ""));
+  }
+  return { ...result.data, normalizedFields };
 }
 
 // src/server/services/summary-service.ts
@@ -20389,16 +20571,15 @@ Return exactly one JSON object: {"findings":[{"region":1,"reason":"\u5177\u4F53\
       });
     }
     context.report(0.82, "Validating summary slices");
-    let payload;
+    let parsed;
     try {
-      payload = JSON.parse(generated.value.trim());
-    } catch {
-      throw Object.assign(new Error("Summary response must be one complete JSON object."), {
+      parsed = parseSummaryOutput(generated.value);
+    } catch (error51) {
+      throw Object.assign(new Error(error51 instanceof Error ? error51.message : "Invalid summary response."), {
         statusCode: 502,
         code: "INVALID_SUMMARY_RESPONSE"
       });
     }
-    const parsed = summaryPayloadSchema.parse(payload);
     const slices = parsed.summaries.map((slice) => ({
       ...slice,
       tags: [...new Set(slice.tags)]
@@ -20406,7 +20587,7 @@ Return exactly one JSON object: {"findings":[{"region":1,"reason":"\u5177\u4F53\
     if (!request.extractAttributes && slices.some((slice) => slice.continuity)) {
       throw new Error("Temporal/knowledge extraction is disabled; omit continuity attributes.");
     }
-    context.report(0.99, `Validated ${slices.length} summary slices`);
+    context.report(0.99, `Validated ${slices.length} summary slices` + (parsed.normalizedFields ? `; \u517C\u5BB9\u89C4\u8303\u5316 ${parsed.normalizedFields} \u4E2A\u683C\u5F0F\u5B57\u6BB5` : ""));
     return { outcome: "completed", slices, attempts: generated.attempts };
   }
 };
