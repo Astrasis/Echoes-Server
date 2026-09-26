@@ -15607,22 +15607,42 @@ var statusPatchOperationSchema = external_exports.discriminatedUnion("op", [
 var statusPayloadSchema = external_exports.object({
   operations: external_exports.array(statusPatchOperationSchema).max(500)
 }).strict();
-var statusProviderOperationSchema = external_exports.discriminatedUnion("op", [
+var statusProviderPathSchema = external_exports.preprocess((value) => {
+  if (typeof value === "string" && value.startsWith("/")) {
+    return value.slice(1).split("/").map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+  }
+  return value;
+}, external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(32));
+var statusProviderOperationSchema = external_exports.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const operation = value;
+  const op = typeof operation.op === "string" ? operation.op.trim().toLowerCase() : operation.op;
+  return { ...operation, op: op === "add" || op === "replace" ? "set" : op === "remove" ? "delete" : op };
+}, external_exports.discriminatedUnion("op", [
   external_exports.object({
     op: external_exports.literal("set"),
-    path: external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(32),
-    value: jsonValueSchema,
-    evidenceMessageIds: external_exports.array(external_exports.string().trim().min(1).max(240)).max(500).optional()
-  }).strict(),
+    path: statusProviderPathSchema,
+    value: jsonValueSchema
+  }),
   external_exports.object({
     op: external_exports.literal("delete"),
-    path: external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(32),
-    evidenceMessageIds: external_exports.array(external_exports.string().trim().min(1).max(240)).max(500).optional()
-  }).strict()
-]);
-var statusProviderPayloadSchema = external_exports.object({
+    path: statusProviderPathSchema
+  })
+]));
+var statusProviderPayloadSchema = external_exports.preprocess((value) => {
+  if (Array.isArray(value)) return { operations: value };
+  if (!value || typeof value !== "object") return value;
+  const payload = value;
+  if (!Object.hasOwn(payload, "operations") && Object.hasOwn(payload, "op")) {
+    return { operations: [payload] };
+  }
+  if (payload.operations && typeof payload.operations === "object" && !Array.isArray(payload.operations)) {
+    return { ...payload, operations: [payload.operations] };
+  }
+  return value;
+}, external_exports.object({
   operations: external_exports.array(statusProviderOperationSchema).max(500)
-}).strict();
+}));
 var statusUpdateRequestSchema = external_exports.object({
   chatId: external_exports.string().trim().min(1).max(240),
   namespaceId: identifierSchema,
@@ -16313,7 +16333,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.3", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.2.4", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -20640,23 +20660,11 @@ function assertPath(path6) {
     }
   }
 }
-function pathsOverlap(left, right) {
-  const common = Math.min(left.length, right.length);
-  for (let index = 0; index < common; index += 1) {
-    if (left[index] !== right[index]) return false;
-  }
-  return true;
-}
 function assertOperations(operations, evidenceMessageIds) {
   for (const [index, operation] of operations.entries()) {
     assertPath(operation.path);
     if (operation.evidenceMessageIds.length === 0 || operation.evidenceMessageIds.some((id) => !evidenceMessageIds.has(id))) {
       throw new StatusValidationError(`Operation ${index + 1} cites evidence outside this update.`);
-    }
-    for (let previous = 0; previous < index; previous += 1) {
-      if (pathsOverlap(operation.path, operations[previous].path)) {
-        throw new StatusValidationError(`Operation ${index + 1} overlaps another status path.`);
-      }
     }
   }
 }
@@ -20719,18 +20727,23 @@ function valueType(value) {
 function primitiveEquals(left, right) {
   return left === right;
 }
-function validateRule(state, previousState, rule) {
+function validateRule(state, previousState, rule, changedOnly = false) {
   if (rule.path.length === 0 || rule.path.some((segment) => segment !== "*" && (!segment || segment.length > 200 || BLOCKED_SEGMENTS.has(segment)))) {
     throw new StatusValidationError(`Unsafe validation path: ${rule.path.join(".")}.`);
   }
   const matched = matchRule(state, rule.path);
   const values = matched.values;
-  if (rule.required && (values.length === 0 || matched.missingPaths.length > 0)) {
-    const missingPath = matched.missingPaths[0] ?? rule.path;
+  const oldMatches = matchRule(previousState, rule.path);
+  const previouslyMissing = new Set(oldMatches.missingPaths.map((path6) => path6.join("\0")));
+  const missingPaths = changedOnly ? matched.missingPaths.filter((path6) => !previouslyMissing.has(path6.join("\0"))) : matched.missingPaths;
+  if (rule.required && (missingPaths.length > 0 || !changedOnly && values.length === 0)) {
+    const missingPath = missingPaths[0] ?? rule.path;
     throw new StatusValidationError(`${rule.name} is required at ${missingPath.join(".")}.`);
   }
   const previous = new Map(matchValues(previousState, rule.path).map((item) => [item.path.join("\0"), item.value]));
   for (const item of values) {
+    const oldValue = previous.get(item.path.join("\0"));
+    if (changedOnly && oldValue !== void 0 && canonical2(item.value) === canonical2(oldValue)) continue;
     if (valueType(item.value) !== rule.type) {
       throw new StatusValidationError(`${rule.name} must be ${rule.type}.`);
     }
@@ -20744,7 +20757,6 @@ function validateRule(state, previousState, rule) {
       if (rule.maximum !== void 0 && item.value > rule.maximum) {
         throw new StatusValidationError(`${rule.name} exceeds its maximum.`);
       }
-      const oldValue = previous.get(item.path.join("\0"));
       if (rule.maxDelta !== void 0 && typeof oldValue === "number" && Math.abs(item.value - oldValue) > rule.maxDelta) {
         throw new StatusValidationError(`${rule.name} exceeds its maximum single-update change.`);
       }
@@ -20753,17 +20765,19 @@ function validateRule(state, previousState, rule) {
 }
 function pathCovered(path6, rules) {
   return rules.some((rule) => {
-    if (path6.length > rule.path.length) return false;
-    return path6.every((segment, index) => rule.path[index] === "*" || rule.path[index] === segment);
+    if (path6.length > rule.path.length && rule.type !== "object") return false;
+    return path6.slice(0, rule.path.length).every((segment, index) => rule.path[index] === "*" || rule.path[index] === segment);
   });
 }
-function validateKnownPaths(value, rules, path6 = []) {
+function validateKnownPaths(value, rules, path6 = [], previous) {
   for (const [key, child] of Object.entries(value)) {
     const childPath = [...path6, key];
+    const oldValue = previous?.[key];
+    if (oldValue !== void 0 && canonical2(child) === canonical2(oldValue)) continue;
     if (!pathCovered(childPath, rules)) {
       throw new StatusValidationError(`Unknown status field: ${childPath.join(".")}.`);
     }
-    if (isObject2(child)) validateKnownPaths(child, rules, childPath);
+    if (isObject2(child)) validateKnownPaths(child, rules, childPath, isObject2(oldValue) ? oldValue : void 0);
   }
 }
 function assertSafeValue(value, path6 = []) {
@@ -20779,10 +20793,12 @@ function assertSafeValue(value, path6 = []) {
     assertSafeValue(child, [...path6, key]);
   }
 }
-function validateStatusState(state, previousState, validation) {
+function validateStatusState(state, previousState, validation, changedOnly = false) {
   assertSafeValue(state);
-  if (validation.unknownFields === "reject") validateKnownPaths(state, validation.rules);
-  for (const rule of validation.rules) validateRule(state, previousState, rule);
+  if (validation.unknownFields === "reject") {
+    validateKnownPaths(state, validation.rules, [], changedOnly ? previousState : void 0);
+  }
+  for (const rule of validation.rules) validateRule(state, previousState, rule, changedOnly);
 }
 function applyStatusOperations(options) {
   assertOperations(options.operations, new Set(options.evidenceMessageIds));
@@ -20791,7 +20807,19 @@ function applyStatusOperations(options) {
     if (operation.op === "set") setAtPath(next, operation.path, operation.value);
     else deleteAtPath(next, operation.path);
   }
-  validateStatusState(next, options.baseState, options.validation);
+  for (const rule of options.validation.rules) {
+    for (const { path: path6, value } of matchValues(next, rule.path)) {
+      if (typeof value !== "string") continue;
+      const old = matchValues(options.baseState, path6)[0]?.value;
+      if (value === old) continue;
+      const text = value.trim();
+      if (rule.type === "number" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(text) && Number.isFinite(Number(text))) setAtPath(next, path6, Number(text));
+      if (rule.type === "boolean" && /^(true|false)$/i.test(text)) {
+        setAtPath(next, path6, text.toLowerCase() === "true");
+      }
+    }
+  }
+  validateStatusState(next, options.baseState, options.validation, true);
   return next;
 }
 function canonical2(value) {
@@ -20806,11 +20834,28 @@ async function statusStateHash(state) {
   return sha256Hex(canonicalStatusJson(state));
 }
 
+// src/shared/status-prompts.ts
+var STATUS_OUTPUT_PROTOCOL = `\u56DE\u590D\u683C\u5F0F\uFF1A\u4EC5\u8F93\u51FA\u4E00\u4E2A JSON \u5BF9\u8C61 {"operations":[...]}\uFF0C\u4E0D\u9700\u8981 <thinking> \u6216\u5176\u4ED6\u5206\u6790\u6587\u5B57\u3002
+\u65B0\u589E\u6216\u66F4\u65B0\uFF1A{"op":"set","path":["\u5206\u7C7B","\u5B57\u6BB5"],"value":"\u65B0\u503C"}
+\u5220\u9664\uFF1A{"op":"delete","path":["\u5206\u7C7B","\u5B57\u6BB5"]}
+\u6CA1\u6709\u53D8\u5316\uFF1A{"operations":[]}
+path \u4F7F\u7528\u5B57\u6BB5\u540D\u79F0\u7EC4\u6210\u7684\u6570\u7EC4\uFF1Bvalue \u53EF\u4EE5\u662F\u5B57\u7B26\u4E32\u3001\u6570\u5B57\u3001\u5E03\u5C14\u503C\u3001\u5BF9\u8C61\u6216\u6570\u7EC4\uFF0C\u6CBF\u7528\u5DF2\u6709\u5B57\u6BB5\u7684\u6570\u636E\u7C7B\u578B\u3002
+\u66F4\u65B0\u5DF2\u6709\u5BF9\u8C61\u65F6\u4F18\u5148\u4FEE\u6539\u5177\u4F53\u5B50\u5B57\u6BB5\uFF1Bset \u6574\u4E2A\u5BF9\u8C61\u4F1A\u66FF\u6362\u5176\u539F\u5185\u5BB9\uFF0C\u56E0\u6B64\u5E94\u4FDD\u7559\u4ECD\u7136\u6709\u6548\u7684\u5B50\u5B57\u6BB5\u3002
+\u64CD\u4F5C\u6309\u6570\u7EC4\u987A\u5E8F\u6267\u884C\uFF0C\u540E\u9762\u7684\u64CD\u4F5C\u53EF\u4EE5\u8986\u76D6\u524D\u9762\u7684\u64CD\u4F5C\u3002\u65E0\u53D8\u5316\u7684\u5B57\u6BB5\u4E0D\u7528\u8F93\u51FA\uFF0C\u4E5F\u4E0D\u7528\u586B\u5199\u6765\u6E90\u6D88\u606F\u7F16\u53F7\u3002
+\u4E0A\u8FF0\u4EC5\u4E3A\u683C\u5F0F\u793A\u610F\uFF0C\u4E0D\u662F\u5F85\u5199\u5165\u7684\u5267\u60C5\u3002`;
+var DEFAULT_STATUS_UPDATE_PROMPT = `<response_format>
+\u5148\u786E\u5B9A\u672C\u6BB5\u5267\u60C5\u7ED3\u675F\u65F6\u7684\u5C40\u9762\uFF0C\u518D\u53EA\u8F93\u51FA\u9700\u8981\u66F4\u65B0\u7684\u72B6\u6001\uFF1A
+- \u65F6\u7A7A\u72B6\u6001\uFF1A\u65E5\u671F\u3001\u65F6\u95F4\u3001\u5F53\u524D\u5730\u70B9\u3001\u5728\u573A\u89D2\u8272\u3001\u5F53\u524D\u5C40\u52BF\u53CA\u884C\u52A8\u9650\u5236\u3002\u65F6\u95F4\u4E0D\u660E\u786E\u65F6\u4FDD\u7559\u539F\u503C\u6216\u539F\u6709\u7684\u4E0D\u786E\u5B9A\u6027\u3002
+- \u626E\u6F14\u4EBA\u7269\u72B6\u6001\uFF1A\u4EE5\u4EBA\u7269\u59D3\u540D\u533A\u5206\uFF0C\u8BB0\u5F55\u5F53\u524D\u6240\u5728\u5730\u70B9\u3001\u8EAB\u4F53\u72B6\u51B5\u3001\u7A7F\u7740\u53D8\u5316\u3001\u5F71\u54CD\u884C\u52A8\u7684\u5FC3\u7406\u72B6\u6001\u548C\u4E34\u65F6\u9650\u5236\u3002
+- \u8BA1\u5212\u4E0E\u627F\u8BFA\uFF1A\u4FDD\u7559\u672A\u5B8C\u6210\u7684\u76EE\u6807\u3001\u7EA6\u5B9A\u3001\u627F\u8BFA\u548C\u9700\u8981\u5904\u7406\u7684\u95EE\u9898\u3002\u660E\u786E\u7ED3\u675F\u7684\u4E8B\u9879\u4F7F\u7528 delete \u79FB\u9664\u3002
+\u6CBF\u7528\u5F53\u524D\u72B6\u6001\u7684\u7EC4\u7EC7\u65B9\u5F0F\uFF0C\u4E0D\u4E3A\u51D1\u9F50\u6A21\u677F\u589E\u52A0\u672A\u77E5\u5B57\u6BB5\uFF0C\u4E5F\u4E0D\u5C06\u672A\u63D0\u53CA\u7684\u4E8B\u9879\u89C6\u4E3A\u5DF2\u5B8C\u6210\u3002
+${STATUS_OUTPUT_PROTOCOL}
+
+\u865A\u6784\u683C\u5F0F\u793A\u4F8B\uFF1A
+{"operations":[{"op":"set","path":["\u65F6\u7A7A\u72B6\u6001","\u5F53\u524D\u5730\u70B9"],"value":"\u82D4\u6E7E\u9547\u7684\u949F\u697C"},{"op":"set","path":["\u626E\u6F14\u4EBA\u7269\u72B6\u6001","\u6E29\u781A","\u8EAB\u4F53\u72B6\u6001"],"value":"\u5DE6\u624B\u64E6\u4F24\uFF0C\u5DF2\u5305\u624E"},{"op":"delete","path":["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u5DF2\u63A5\u53D7\u4EFB\u52A1\u6216\u7EA6\u5B9A","\u5F52\u8FD8\u7F57\u76D8"]}]}
+</response_format>`;
+
 // src/server/services/status-service.ts
-var STATUS_OUTPUT_PROTOCOL = `You MUST output both sections in this exact order:
-<thinking>Your step-by-step state comparison, routing, cleanup, and final verification</thinking>
-{"operations":[{"op":"set","path":["category","field"],"value":"new value"},{"op":"delete","path":["category","obsolete field"]}]}
-Use only set and delete operations. Return {"operations":[]} when nothing changed. The JSON must appear after </thinking>. Do not include any other text.`;
 function unwrapStatusFence(value) {
   return value.match(/^```(?:json|xml|text)?\s*\n([\s\S]*?)\n```\s*$/i)?.[1]?.trim() ?? value;
 }
@@ -20844,15 +20889,15 @@ var StatusService = class {
     }
     const providerMessages = [
       ...request.promptMessages,
+      ...request.validation.rules.length || request.validation.unknownFields === "reject" ? [{ role: "system", content: `\u672C\u6B21\u7528\u6237\u914D\u7F6E\u7684\u72B6\u6001\u5B57\u6BB5\u7EA6\u675F\uFF08* \u8868\u793A\u4EFB\u610F\u540D\u79F0\uFF09\uFF1A
+${JSON.stringify(request.validation)}
+\u6CBF\u7528\u73B0\u6709\u72B6\u6001\uFF0C\u65E0\u53D8\u5316\u5B57\u6BB5\u4E0D\u9700\u8981\u91CD\u590D\u8F93\u51FA\u3002` }] : [],
       { role: "user", content: STATUS_OUTPUT_PROTOCOL }
     ];
     context.report(0.1, "Waiting for status API");
     const generated = await this.generation.run({
       workflow: "status",
-      group: {
-        ...request.generationGroup,
-        endpoints: request.generationGroup.endpoints.map((endpoint) => ({ ...endpoint, jsonMode: false }))
-      },
+      group: request.generationGroup,
       policy: request.failoverPolicy,
       resumeAfterEndpointId: request.resumeAfterEndpointId,
       messages: providerMessages,
