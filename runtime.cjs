@@ -15752,6 +15752,11 @@ var retrievalDocumentSyncRequestSchema = external_exports.object({
 var retrievalDocumentStatusRequestSchema = external_exports.object({
   documentIds: external_exports.array(identifierSchema).min(1).max(1e3)
 });
+var retrievalDocumentManifestRequestSchema = external_exports.object({
+  collectionId: identifierSchema,
+  afterDocumentId: identifierSchema.optional(),
+  limit: external_exports.number().int().min(1).max(1e3).default(500)
+});
 var retrievalRebuildRequestSchema = external_exports.object({
   collectionIds: external_exports.array(identifierSchema).min(1).max(100),
   failoverPolicy: failoverPolicySchema.default("confirm_ambiguous"),
@@ -15851,6 +15856,7 @@ var statusSnapshotSchema = external_exports.object({
   stateHash: external_exports.string().regex(/^[a-f0-9]{64}$/),
   revision: external_exports.number().int().min(1),
   origin: external_exports.enum(["auto", "manual", "restored"]),
+  manualOverride: external_exports.boolean().optional(),
   createdAt: external_exports.string().datetime(),
   updatedAt: external_exports.string().datetime()
 }).strict();
@@ -16333,7 +16339,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.4", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.2.5", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -16565,6 +16571,14 @@ function registerRoutes(options) {
       const runtime = await runtimes2.forRequest(request);
       const input = retrievalDocumentStatusRequestSchema.parse(request.body);
       response.json(await retrieval(runtime).documentStatus(input.documentIds));
+    })
+  );
+  router.post(
+    "/retrieval/documents/manifest",
+    route(async (request, response) => {
+      const runtime = await runtimes2.forRequest(request);
+      const input = retrievalDocumentManifestRequestSchema.parse(request.body);
+      response.json(await retrieval(runtime).store.documentManifest(input.collectionId, input.afterDocumentId, input.limit));
     })
   );
   router.post(
@@ -17858,12 +17872,13 @@ var RetrievalService = class {
   async documentStatus(documentIds) {
     const documents = await this.store.getDocuments(documentIds);
     return {
-      documents: documents.map(({ documentId, collectionId, contentHash, vectorState, updatedAt }) => ({
+      documents: documents.map(({ documentId, collectionId, contentHash, vectorState, updatedAt, metadata }) => ({
         documentId,
         collectionId,
         contentHash,
         vectorState,
-        updatedAt
+        updatedAt,
+        ...typeof metadata.bodyHash === "string" ? { bodyHash: metadata.bodyHash } : {}
       }))
     };
   }
@@ -18700,6 +18715,19 @@ var RetrievalStore = class {
     const documents = [];
     for await (const batch of this.documentBatches(collectionIds, batchSize)) documents.push(...batch);
     return documents;
+  }
+  async documentManifest(collectionId, afterDocumentId, limit = 500) {
+    const table = await this.documentsTable();
+    const filters = [`collection_id = ${sqlString(collectionId)}`];
+    if (afterDocumentId) filters.push(`document_id > ${sqlString(afterDocumentId)}`);
+    const rows = await table.query().select(["document_id", "collection_id", "source_type", "source_id"]).where(filters.join(" AND ")).orderBy({ columnName: "document_id", ascending: true }).limit(limit).toArray();
+    const documents = rows.map((row) => ({
+      documentId: String(row.document_id),
+      collectionId: String(row.collection_id),
+      sourceType: String(row.source_type),
+      sourceId: String(row.source_id)
+    }));
+    return { documents, ...documents.length === limit ? { nextAfterDocumentId: documents.at(-1).documentId } : {} };
   }
   async *documentBatches(collectionIds, batchSize = 100, vectorStates = []) {
     const table = await this.documentsTable();
@@ -19900,6 +19928,7 @@ async function requestStructuredCompletion(options) {
         response.status === 408 || response.status === 429 || response.status >= 500
       );
     }
+    options.onResponse?.();
     const contentType = response.headers.get("content-type") ?? "";
     if (!config2.streaming || contentType.includes("application/json")) {
       return await readJsonContent(response);
@@ -19998,6 +20027,167 @@ async function requestStructuredCompletion(options) {
   }
 }
 
+// src/server/services/summary-output.ts
+function object2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function unwrapFence(value) {
+  return value.match(/^```(?:json|text)?[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/i)?.[1]?.trim() ?? value;
+}
+function parseSummaryJson(raw, label = "\u603B\u7ED3\u5207\u7247") {
+  let content = unwrapFence(raw.trim());
+  const reasoning = content.match(/^<(thinking|think)>[\s\S]*?<\/\1>\s*/i);
+  if (reasoning) content = content.slice(reasoning[0].length).trim();
+  content = unwrapFence(content);
+  try {
+    const value = JSON.parse(content);
+    if (!object2(value)) throw new Error("Expected an object.");
+    return value;
+  } catch {
+    throw new Error(`${label}\u54CD\u5E94\u5FC5\u987B\u662F\u4E00\u4E2A\u5B8C\u6574 JSON \u5BF9\u8C61\uFF1B\u5F53\u524D\u5185\u5BB9\u53EF\u80FD\u88AB\u622A\u65AD\u3001\u542B\u989D\u5916\u6587\u5B57\u6216\u591A\u4E2A\u5BF9\u8C61\u3002\u5B8C\u6574\u7684\u4EE3\u7801\u56F4\u680F\u548C\u5DF2\u95ED\u5408\u7684 think/thinking \u524D\u7F00\u53EF\u81EA\u52A8\u5904\u7406\u3002`);
+  }
+}
+function normalizeSingleTime(raw) {
+  if (summaryTimestampSchema.safeParse(raw).success) return { value: raw };
+  if (/^(?:unknown|未知|时间不明)$/i.test(raw)) return { value: "unknown" };
+  const chinese = /^(\d{4})年(?:(\d{1,2})月(?:(\d{1,2})日?(?:\s*(\d{1,2})(?:时|点)(?:(\d{1,2})分(?:(\d{1,2})秒)?)?)?)?)?$/.exec(raw);
+  const numeric = /^(\d{4})(?:[-/](\d{1,2})(?:[-/](\d{1,2})(?:[Tt ](\d{1,2})(?::(\d{2})(?::(\d{2})(?:\.\d+)?)?)?)?)?)?$/.exec(raw);
+  const match = chinese ?? numeric;
+  if (!match) return null;
+  if (match[5] !== void 0 && Number(match[5]) > 59 || match[6] !== void 0 && Number(match[6]) > 59) return null;
+  const value = match[1] + (match[2] === void 0 ? "" : `-${match[2].padStart(2, "0")}`) + (match[3] === void 0 ? "" : `-${match[3].padStart(2, "0")}`) + (match[4] === void 0 ? "" : `T${match[4].padStart(2, "0")}`);
+  if (!summaryTimestampSchema.safeParse(value).success) return null;
+  return { value, ...match[5] === void 0 ? {} : { detail: raw } };
+}
+function normalizeTime(raw, allowRange) {
+  const single = normalizeSingleTime(raw);
+  if (single || !allowRange) return single;
+  const parts = raw.split(/\s*(?:~|～|至|到|–|—)\s*|\s+-\s+/);
+  if (parts.length !== 2) return null;
+  const start = normalizeSingleTime(parts[0]);
+  const end = normalizeSingleTime(parts[1]);
+  if (!start || !end || start.value === "unknown" || end.value === "unknown") return null;
+  const precision = Math.min(start.value.length, end.value.length);
+  if (start.value.slice(0, precision) > end.value.slice(0, precision)) return null;
+  return { value: start.value, detail: raw };
+}
+var enumAliases = {
+  changeKind: {
+    fact_change: "fact_change",
+    knowledge_change: "knowledge_change",
+    canon_correction: "canon_correction",
+    unclassified: "unclassified",
+    \u4E8B\u5B9E\u53D8\u5316: "fact_change",
+    \u4E8B\u5B9E\u53D1\u751F\u53D8\u5316: "fact_change",
+    \u8BA4\u77E5\u53D8\u5316: "knowledge_change",
+    \u89D2\u8272\u8BA4\u77E5\u53D8\u5316: "knowledge_change",
+    \u8BBE\u5B9A\u66F4\u6B63: "canon_correction",
+    \u66F4\u6B63\u65E7\u8BBE\u5B9A: "canon_correction",
+    \u672A\u5206\u7C7B: "unclassified"
+  },
+  validity: {
+    current: "current",
+    historical: "historical",
+    superseded: "superseded",
+    \u5F53\u524D\u6709\u6548: "current",
+    \u5386\u53F2\u7ECF\u5386: "historical",
+    \u5DF2\u88AB\u66F4\u6B63\u5931\u6548: "superseded"
+  },
+  state: {
+    known: "known",
+    believed: "believed",
+    suspected: "suspected",
+    misunderstood: "misunderstood",
+    unknown: "unknown",
+    \u5DF2\u77E5: "known",
+    \u76F8\u4FE1: "believed",
+    \u6000\u7591: "suspected",
+    \u8BEF\u89E3: "misunderstood",
+    \u672A\u77E5: "unknown"
+  }
+};
+function parseSummaryOutput(raw) {
+  let payload;
+  try {
+    payload = parseSummaryJson(raw);
+  } catch (error51) {
+    throw new Error(`${error51 instanceof Error ? error51.message : String(error51)} \u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002`);
+  }
+  let normalizedFields = 0;
+  if (object2(payload) && Array.isArray(payload.summaries)) {
+    for (const slice of payload.summaries) {
+      if (!object2(slice)) continue;
+      const timestamp = typeof slice.timestamp === "string" ? normalizeTime(slice.timestamp.trim(), true) : null;
+      if (timestamp && timestamp.value !== slice.timestamp) {
+        slice.timestamp = timestamp.value;
+        if (timestamp.detail && typeof slice.content === "string") {
+          slice.content += `
+\u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${timestamp.detail}`;
+        }
+        normalizedFields++;
+      }
+      if (!object2(slice.continuity)) continue;
+      const continuity = slice.continuity;
+      const notes = [];
+      const normalizeEnum = (target, field) => {
+        const value = target[field];
+        if (typeof value !== "string") return;
+        const key = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+        const aliases = enumAliases[field];
+        const mapped = aliases && Object.hasOwn(aliases, key) ? aliases[key] : void 0;
+        if (mapped !== void 0) {
+          if (mapped !== value) {
+            target[field] = mapped;
+            normalizedFields++;
+          }
+        } else if (field === "changeKind") {
+          target[field] = "unclassified";
+          notes.push(`\u6A21\u578B\u539F\u59CB\u53D8\u5316\u5206\u7C7B\uFF1A${value}`);
+          normalizedFields++;
+        }
+      };
+      const normalizeAttributeTime = (target, field) => {
+        if (typeof target[field] !== "string") return;
+        const rawTime = target[field];
+        const result2 = normalizeTime(rawTime.trim(), false);
+        if (result2 && result2.value !== rawTime) {
+          target[field] = result2.value;
+          if (result2.detail) notes.push(`${field} \u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${result2.detail}`);
+          normalizedFields++;
+        }
+      };
+      normalizeEnum(continuity, "changeKind");
+      normalizeEnum(continuity, "validity");
+      for (const field of ["eventTime", "learnedTime", "validFrom", "validUntil"]) normalizeAttributeTime(continuity, field);
+      if (Array.isArray(continuity.knowledge)) for (const knowledge of continuity.knowledge) {
+        if (!object2(knowledge)) continue;
+        normalizeEnum(knowledge, "state");
+        normalizeAttributeTime(knowledge, "learnedTime");
+      }
+      if (notes.length && (continuity.note === void 0 || typeof continuity.note === "string")) {
+        continuity.note = [continuity.note, ...notes].filter(Boolean).join("\n");
+      }
+    }
+  }
+  const result = summaryPayloadSchema.safeParse(payload);
+  if (!result.success) {
+    const issues = result.error.issues.slice(0, 10).map((issue2) => {
+      let value = payload;
+      for (const part of issue2.path) {
+        value = value !== null && typeof value === "object" ? Reflect.get(value, part) : void 0;
+      }
+      const field = issue2.path.at(-1);
+      const showValue = ["timestamp", "eventTime", "learnedTime", "validFrom", "validUntil", "changeKind", "validity", "state"].includes(String(field));
+      const actual = showValue ? ` (received ${JSON.stringify(value)?.slice(0, 160) ?? "undefined"})` : "";
+      return `${issue2.path.join(".")}: ${issue2.message}${actual}`;
+    });
+    throw new Error(`\u603B\u7ED3\u8F93\u51FA\u6821\u9A8C\u5931\u8D25\uFF1B\u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002
+${issues.join("\n")}` + (result.error.issues.length > 10 ? `
+\u53E6\u6709 ${result.error.issues.length - 10} \u9879\u6821\u9A8C\u9519\u8BEF\u3002` : ""));
+  }
+  return { ...result.data, normalizedFields };
+}
+
 // src/server/services/generation-service.ts
 function parseProviderJsonObject(raw) {
   const trimmed = raw.trim();
@@ -20061,6 +20251,8 @@ var GenerationService = class {
   }
   async testEndpoint(endpoint, context) {
     const startedAt = Date.now();
+    let stage = "\u8FDE\u63A5\u7AEF\u70B9";
+    context.report(0.1, "\u6309\u7AEF\u70B9\u914D\u7F6E\u6D4B\u8BD5\u8FDE\u63A5");
     const result = await runEndpointChain({
       provider: "generation",
       workflow: "summary",
@@ -20070,21 +20262,34 @@ var GenerationService = class {
       signal: context.signal,
       resolveEndpoint: this.resolveEndpoint,
       invoke: (candidate) => requestStructuredCompletion({
-        config: { ...candidate, streaming: false, jsonMode: true },
+        config: candidate,
         messages: [
           { role: "system", content: "Return a JSON object only." },
           { role: "user", content: 'Return {"ok":true}.' }
         ],
-        signal: context.signal
+        signal: context.signal,
+        onResponse: () => {
+          stage = "\u8BFB\u53D6\u54CD\u5E94";
+          context.report(0.4, "\u7AEF\u70B9\u5DF2\u54CD\u5E94\uFF0C\u6B63\u5728\u8BFB\u53D6\u6A21\u578B\u8F93\u51FA");
+        },
+        onProgress: (characters) => context.report(0.6, `\u6B63\u5728\u8BFB\u53D6\u6A21\u578B\u8F93\u51FA\uFF08${characters} \u5B57\u7B26\uFF09`)
       })
     });
     if (result.state !== "succeeded") {
-      throw Object.assign(new Error(result.message ?? "Generation endpoint test failed."), {
+      throw Object.assign(new Error(`${stage}\u5931\u8D25\uFF1A${result.message ?? "Generation endpoint test failed."}`), {
         statusCode: 502,
         code: result.state === "ambiguous" ? "AMBIGUOUS_PROVIDER_OUTCOME" : "ENDPOINT_TEST_FAILED"
       });
     }
-    parseProviderJsonObject(result.value ?? "");
+    context.report(0.9, "\u54CD\u5E94\u8BFB\u53D6\u5B8C\u6210\uFF0C\u6B63\u5728\u89E3\u6790\u6D4B\u8BD5\u7ED3\u679C");
+    try {
+      parseSummaryJson(result.value ?? "", "\u7AEF\u70B9\u6D4B\u8BD5");
+    } catch (error51) {
+      throw Object.assign(new Error(`\u7AEF\u70B9\u8FDE\u63A5\u4E0E\u54CD\u5E94\u8BFB\u53D6\u6210\u529F\uFF0C\u4F46\u8F93\u51FA\u89E3\u6790\u5931\u8D25\uFF1A${error51 instanceof Error ? error51.message : String(error51)}`), {
+        statusCode: 502,
+        code: "INVALID_ENDPOINT_TEST_RESPONSE"
+      });
+    }
     return {
       endpointId: endpoint.id,
       kind: "generation",
@@ -20342,162 +20547,6 @@ function summaryProviderMessages(request) {
   ];
 }
 
-// src/server/services/summary-output.ts
-function object2(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function unwrapFence(value) {
-  return value.match(/^```(?:json|text)?[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/i)?.[1]?.trim() ?? value;
-}
-function parseSummaryJson(raw) {
-  let content = unwrapFence(raw.trim());
-  const reasoning = content.match(/^<(thinking|think)>[\s\S]*?<\/\1>\s*/i);
-  if (reasoning) content = content.slice(reasoning[0].length).trim();
-  content = unwrapFence(content);
-  try {
-    const value = JSON.parse(content);
-    if (!object2(value)) throw new Error("Expected an object.");
-    return value;
-  } catch {
-    throw new Error("Summary response must be one complete JSON object. \u603B\u7ED3\u54CD\u5E94\u4E0D\u662F\u5B8C\u6574 JSON \u5BF9\u8C61\uFF0C\u53EF\u80FD\u88AB\u622A\u65AD\u3001\u542B\u989D\u5916\u6587\u5B57\u6216\u591A\u4E2A\u5BF9\u8C61\uFF1B\u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002\u5B8C\u6574\u7684\u4EE3\u7801\u56F4\u680F\u548C\u5DF2\u95ED\u5408\u7684 think/thinking \u524D\u7F00\u53EF\u81EA\u52A8\u5904\u7406\u3002");
-  }
-}
-function normalizeSingleTime(raw) {
-  if (summaryTimestampSchema.safeParse(raw).success) return { value: raw };
-  if (/^(?:unknown|未知|时间不明)$/i.test(raw)) return { value: "unknown" };
-  const chinese = /^(\d{4})年(?:(\d{1,2})月(?:(\d{1,2})日?(?:\s*(\d{1,2})(?:时|点)(?:(\d{1,2})分(?:(\d{1,2})秒)?)?)?)?)?$/.exec(raw);
-  const numeric = /^(\d{4})(?:[-/](\d{1,2})(?:[-/](\d{1,2})(?:[Tt ](\d{1,2})(?::(\d{2})(?::(\d{2})(?:\.\d+)?)?)?)?)?)?$/.exec(raw);
-  const match = chinese ?? numeric;
-  if (!match) return null;
-  if (match[5] !== void 0 && Number(match[5]) > 59 || match[6] !== void 0 && Number(match[6]) > 59) return null;
-  const value = match[1] + (match[2] === void 0 ? "" : `-${match[2].padStart(2, "0")}`) + (match[3] === void 0 ? "" : `-${match[3].padStart(2, "0")}`) + (match[4] === void 0 ? "" : `T${match[4].padStart(2, "0")}`);
-  if (!summaryTimestampSchema.safeParse(value).success) return null;
-  return { value, ...match[5] === void 0 ? {} : { detail: raw } };
-}
-function normalizeTime(raw, allowRange) {
-  const single = normalizeSingleTime(raw);
-  if (single || !allowRange) return single;
-  const parts = raw.split(/\s*(?:~|～|至|到|–|—)\s*|\s+-\s+/);
-  if (parts.length !== 2) return null;
-  const start = normalizeSingleTime(parts[0]);
-  const end = normalizeSingleTime(parts[1]);
-  if (!start || !end || start.value === "unknown" || end.value === "unknown") return null;
-  const precision = Math.min(start.value.length, end.value.length);
-  if (start.value.slice(0, precision) > end.value.slice(0, precision)) return null;
-  return { value: start.value, detail: raw };
-}
-var enumAliases = {
-  changeKind: {
-    fact_change: "fact_change",
-    knowledge_change: "knowledge_change",
-    canon_correction: "canon_correction",
-    unclassified: "unclassified",
-    \u4E8B\u5B9E\u53D8\u5316: "fact_change",
-    \u4E8B\u5B9E\u53D1\u751F\u53D8\u5316: "fact_change",
-    \u8BA4\u77E5\u53D8\u5316: "knowledge_change",
-    \u89D2\u8272\u8BA4\u77E5\u53D8\u5316: "knowledge_change",
-    \u8BBE\u5B9A\u66F4\u6B63: "canon_correction",
-    \u66F4\u6B63\u65E7\u8BBE\u5B9A: "canon_correction",
-    \u672A\u5206\u7C7B: "unclassified"
-  },
-  validity: {
-    current: "current",
-    historical: "historical",
-    superseded: "superseded",
-    \u5F53\u524D\u6709\u6548: "current",
-    \u5386\u53F2\u7ECF\u5386: "historical",
-    \u5DF2\u88AB\u66F4\u6B63\u5931\u6548: "superseded"
-  },
-  state: {
-    known: "known",
-    believed: "believed",
-    suspected: "suspected",
-    misunderstood: "misunderstood",
-    unknown: "unknown",
-    \u5DF2\u77E5: "known",
-    \u76F8\u4FE1: "believed",
-    \u6000\u7591: "suspected",
-    \u8BEF\u89E3: "misunderstood",
-    \u672A\u77E5: "unknown"
-  }
-};
-function parseSummaryOutput(raw) {
-  const payload = parseSummaryJson(raw);
-  let normalizedFields = 0;
-  if (object2(payload) && Array.isArray(payload.summaries)) {
-    for (const slice of payload.summaries) {
-      if (!object2(slice)) continue;
-      const timestamp = typeof slice.timestamp === "string" ? normalizeTime(slice.timestamp.trim(), true) : null;
-      if (timestamp && timestamp.value !== slice.timestamp) {
-        slice.timestamp = timestamp.value;
-        if (timestamp.detail && typeof slice.content === "string") {
-          slice.content += `
-\u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${timestamp.detail}`;
-        }
-        normalizedFields++;
-      }
-      if (!object2(slice.continuity)) continue;
-      const continuity = slice.continuity;
-      const notes = [];
-      const normalizeEnum = (target, field) => {
-        const value = target[field];
-        if (typeof value !== "string") return;
-        const key = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
-        const aliases = enumAliases[field];
-        const mapped = aliases && Object.hasOwn(aliases, key) ? aliases[key] : void 0;
-        if (mapped !== void 0) {
-          if (mapped !== value) {
-            target[field] = mapped;
-            normalizedFields++;
-          }
-        } else if (field === "changeKind") {
-          target[field] = "unclassified";
-          notes.push(`\u6A21\u578B\u539F\u59CB\u53D8\u5316\u5206\u7C7B\uFF1A${value}`);
-          normalizedFields++;
-        }
-      };
-      const normalizeAttributeTime = (target, field) => {
-        if (typeof target[field] !== "string") return;
-        const rawTime = target[field];
-        const result2 = normalizeTime(rawTime.trim(), false);
-        if (result2 && result2.value !== rawTime) {
-          target[field] = result2.value;
-          if (result2.detail) notes.push(`${field} \u65F6\u95F4\u539F\u8BB0\u8F7D\uFF1A${result2.detail}`);
-          normalizedFields++;
-        }
-      };
-      normalizeEnum(continuity, "changeKind");
-      normalizeEnum(continuity, "validity");
-      for (const field of ["eventTime", "learnedTime", "validFrom", "validUntil"]) normalizeAttributeTime(continuity, field);
-      if (Array.isArray(continuity.knowledge)) for (const knowledge of continuity.knowledge) {
-        if (!object2(knowledge)) continue;
-        normalizeEnum(knowledge, "state");
-        normalizeAttributeTime(knowledge, "learnedTime");
-      }
-      if (notes.length && (continuity.note === void 0 || typeof continuity.note === "string")) {
-        continuity.note = [continuity.note, ...notes].filter(Boolean).join("\n");
-      }
-    }
-  }
-  const result = summaryPayloadSchema.safeParse(payload);
-  if (!result.success) {
-    const issues = result.error.issues.slice(0, 10).map((issue2) => {
-      let value = payload;
-      for (const part of issue2.path) {
-        value = value !== null && typeof value === "object" ? Reflect.get(value, part) : void 0;
-      }
-      const field = issue2.path.at(-1);
-      const showValue = ["timestamp", "eventTime", "learnedTime", "validFrom", "validUntil", "changeKind", "validity", "state"].includes(String(field));
-      const actual = showValue ? ` (received ${JSON.stringify(value)?.slice(0, 160) ?? "undefined"})` : "";
-      return `${issue2.path.join(".")}: ${issue2.message}${actual}`;
-    });
-    throw new Error(`\u603B\u7ED3\u8F93\u51FA\u6821\u9A8C\u5931\u8D25\uFF1B\u672C\u6B21\u672A\u5199\u5165\u5207\u7247\u3001\u672A\u63A8\u8FDB\u68C0\u67E5\u70B9\u3002
-${issues.join("\n")}` + (result.error.issues.length > 10 ? `
-\u53E6\u6709 ${result.error.issues.length - 10} \u9879\u6821\u9A8C\u9519\u8BEF\u3002` : ""));
-  }
-  return { ...result.data, normalizedFields };
-}
-
 // src/server/services/summary-service.ts
 var SummaryService = class {
   constructor(generation) {
@@ -20529,13 +20578,7 @@ var SummaryService = class {
     if (generated.state !== "succeeded" || !generated.value) {
       throw new Error(generated.message ?? "Batch summary generation failed.");
     }
-    let payload;
-    try {
-      payload = JSON.parse(generated.value.trim());
-    } catch {
-      throw new Error("\u6279\u6B21\u603B\u7ED3\u5FC5\u987B\u8FD4\u56DE\u5305\u542B content \u7684\u5B8C\u6574 JSON \u5BF9\u8C61\u3002");
-    }
-    const parsed = batchOverviewPayloadSchema.parse(payload);
+    const parsed = batchOverviewPayloadSchema.parse(parseSummaryJson(generated.value, "\u6279\u6B21\u603B\u7ED3"));
     context.report(0.99, "Validated batch summary");
     return { outcome: "completed", content: parsed.content, attempts: generated.attempts };
   }
@@ -20569,13 +20612,7 @@ Return exactly one JSON object: {"findings":[{"region":1,"reason":"\u5177\u4F53\
     if (generated.state !== "succeeded" || !generated.value) {
       throw new Error(generated.message ?? "Coverage generation failed.");
     }
-    let payload;
-    try {
-      payload = JSON.parse(generated.value.trim());
-    } catch {
-      throw new Error("Coverage response must be one complete JSON object.");
-    }
-    const parsed = summaryCoveragePayloadSchema.parse(payload);
+    const parsed = summaryCoveragePayloadSchema.parse(parseSummaryJson(generated.value, "\u603B\u7ED3\u8986\u76D6\u68C0\u67E5"));
     if (parsed.findings.some((finding) => finding.region > request.messages.length)) {
       throw new Error("Coverage response references an unavailable review region.");
     }
