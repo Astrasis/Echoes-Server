@@ -14585,11 +14585,6 @@ var continuitySchema = external_exports.object({
 var aliasSchema = external_exports.array(external_exports.string().trim().min(1).max(240)).max(100);
 var continuitySettingsSchema = external_exports.object({
   extractAttributes: external_exports.boolean().default(false),
-  associations: external_exports.object({
-    enabled: external_exports.boolean().default(false),
-    maxDepth: external_exports.number().int().min(1).max(3).default(1),
-    maxItems: external_exports.number().int().min(0).max(50).default(5)
-  }).default({ enabled: false, maxDepth: 1, maxItems: 5 }),
   triggers: external_exports.object({
     enabled: external_exports.boolean().default(false),
     maxQueries: external_exports.number().int().min(1).max(4).default(2),
@@ -14619,14 +14614,6 @@ Fictional format example, not source facts:
 {"continuity":{"eventTime":"2087-04","changeKind":"knowledge_change","knowledge":[{"character":"\u6D1B\u79BE","state":"suspected","claim":"\u7F57\u76D8\u7684\u5C01\u6761\u53EF\u80FD\u88AB\u66F4\u6362"}]}}
 
 Knowledge states refer to specific claims, not the entire scene. Preserve uncertainty; a later discovery is not earlier knowledge. Omission does not change existing attributes or default character-known rules. Distinguish an actual change from a correction to a previously erroneous record. Use superseded only if the entire record is invalidated. No conflict-priority rules or evidenceMessageIds.`;
-var memoryReferenceSchema = external_exports.object({ kind: external_exports.enum(["row", "summary"]), id: external_exports.string().min(1).max(240) }).strict();
-var memoryLinkSchema = external_exports.object({
-  id: external_exports.string().min(1).max(240),
-  from: memoryReferenceSchema,
-  to: memoryReferenceSchema,
-  relation: external_exports.string().trim().min(1).max(120),
-  enabled: external_exports.boolean()
-}).strict();
 
 // src/shared/status-variables.ts
 var partNames = { base: "\u57FA\u7840\u503C", extra: "\u989D\u5916\u503C", final: "\u6700\u7EC8\u503C" };
@@ -16339,7 +16326,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.6", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.2.7", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
