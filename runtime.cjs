@@ -19942,32 +19942,39 @@ async function requestStructuredCompletion(options) {
     let receivedBytes = 0;
     let completed = false;
     let usage;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (value) {
-        receivedBytes += value.byteLength;
-        if (receivedBytes > MAX_PROVIDER_RESPONSE_BYTES) {
-          await reader.cancel().catch(() => void 0);
-          throw new ProviderResponseTooLargeError(MAX_PROVIDER_RESPONSE_BYTES);
+    try {
+      while (!completed) {
+        const { value, done } = await reader.read();
+        if (value) {
+          receivedBytes += value.byteLength;
+          if (receivedBytes > MAX_PROVIDER_RESPONSE_BYTES) {
+            throw new ProviderResponseTooLargeError(MAX_PROVIDER_RESPONSE_BYTES);
+          }
         }
+        buffer += decoder.decode(value, { stream: !done });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const event = parseEventLine(line);
+          usage = event.usage ?? usage;
+          content += event.content;
+          if (event.done) {
+            completed = true;
+            break;
+          }
+        }
+        onProgress?.(content.length);
+        if (done) break;
       }
-      buffer += decoder.decode(value, { stream: !done });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const event = parseEventLine(line);
+      if (!completed && buffer.trim()) {
+        const event = parseEventLine(buffer);
         usage = event.usage ?? usage;
         content += event.content;
         completed ||= event.done;
       }
-      onProgress?.(content.length);
-      if (done) break;
-    }
-    if (buffer.trim()) {
-      const event = parseEventLine(buffer);
-      usage = event.usage ?? usage;
-      content += event.content;
-      completed ||= event.done;
+    } finally {
+      await reader.cancel().catch(() => void 0);
+      reader.releaseLock();
     }
     if (usage) activeTaskBudget.getStore()?.record({ usage });
     if (!completed) {
