@@ -16339,7 +16339,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.5", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.2.6", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -19659,16 +19659,22 @@ var EXTRACTION_ROW_REFERENCE_GUIDE = `Record references for this request:
 currentRows supplies short rowId references such as R1 and R2. For update or delete, copy the rowId and typeId together from the same currentRows record. These references apply only to this request; the application resolves them to stored IDs.
 For a new record, use add without a rowId and include its complete intended content. Combine changes to a newly proposed record into that add, rather than inventing an ID for a later update. Combine changes to an existing record into one operation.
 Return the operations JSON object only, with Chinese natural-language values.`;
-var EXTRACTION_CLEANING_GUIDE = `This is a user-requested memory cleaning pass over a selected historical message range, not the next incremental batch.
-Look for useful information previously missed. Compare concrete facts with currentRows and propose additions or updates that fill omissions. A previously processed message may still contain unrecorded information.
-Retain valid existing knowledge. Preserve the chronology of historical facts; an earlier condition is not evidence that a later known condition should be reverted. Propose deletions only when explicitly supported. The application will present the proposals for review and preserve the normal extraction checkpoint.`;
+var EXTRACTION_CLEANING_GUIDE = `This is a user-requested memory cleaning pass, not the next incremental batch. The following maintenance rules replace the incremental-only evidence and deletion restrictions for this pass.
+currentRows contains the COMPLETE existing records from every active table, including all stored field values. Read the original fields before proposing replacements. Both these stored records and the selected historical messages are valid sources for this cleaning task; the user's additional instructions can explicitly confirm that differently named records describe the same entity.
+Follow the requested scope: fill omissions, correct records, or consolidate duplicate records. Previously recorded information does not need a new story event to justify reorganizing it. Do not return an empty operations array merely because the selected messages contain no new facts.
+When several records are confirmed to describe the same entity, retain one existing row, preferably the one specified by the user. Integrate their complementary, still-valid information into that row with update, then propose delete for the redundant rows. Use the existing update and delete actions, not a new action or an additional duplicate row.
+Each updated field is a complete replacement: combine its original information with all relevant details from the redundant rows. Preserve useful distinctions, chronology, attribution, uncertainty, keywords and established aliases. Moving information does not make that information invalid. Delete a redundant record only after its still-valid information is represented in the retained record's proposed final content.
+The proposed update and deletions are reviewed and committed together. A name or alias belonging to a redundant row may be transferred to the retained row when that redundant row is also deleted in the same submitted batch.
+Compare identities, not spelling alone. Respect each table's purpose; related records are not necessarily duplicates. Preserve unresolved identity differences and conflicting claims rather than inventing a resolution.
+An earlier condition in the selected history is not evidence that a later known condition should be reverted. Leave unrelated valid records unchanged. Return {"operations":[]} only when the requested cleaning genuinely requires no supported changes.
+The application presents the proposals for review and preserves the normal extraction checkpoint.`;
 function extractionProviderMessages(request) {
   return [
     ...request.promptMessages,
     ...request.extractAttributes ? [{ role: "system", content: CONTINUITY_EXTRACTION_GUIDE }] : [],
     { role: "system", content: "Use optional aliases only for explicitly established alternate names of the same entity. Never equate similarly named entities automatically. In add or update.changes, aliases replaces the alias list; preserve valid earlier aliases." },
     { role: "system", content: EXTRACTION_ROW_REFERENCE_GUIDE },
-    ...request.contextPolicy?.enabled ? [{ role: "system", content: `The entityDirectory lists existing names in this chat's active tables for identity and duplicate checks. currentRows contains selected full records only. A missing detail record is not deleted or unknown. Update/delete only records supplied in currentRows. Reuse existing identities, including declared aliases, rather than creating duplicates. Preserve uncertainty and unchanged fields. The application validates references and revisions against the full stored snapshot.` }] : [],
+    ...request.contextPolicy?.enabled && request.batch.mode !== "cleaning" ? [{ role: "system", content: `The entityDirectory lists existing names in this chat's active tables for identity and duplicate checks. currentRows contains selected full records only. A missing detail record is not deleted or unknown. Update/delete only records supplied in currentRows. Reuse existing identities, including declared aliases, rather than creating duplicates. Preserve uncertainty and unchanged fields. The application validates references and revisions against the full stored snapshot.` }] : [],
     ...request.batch.mode === "cleaning" ? [{ role: "system", content: EXTRACTION_CLEANING_GUIDE }] : [],
     { role: "user", content: JSON.stringify(extractionRuntimeInput(request)) },
     ...request.additionalInstructions?.trim() ? [{ role: "system", content: request.additionalInstructions.trim() }] : []
@@ -19684,9 +19690,17 @@ function extractionRowReferences(rows) {
   }
   return references2;
 }
+function extractionContextRows(request) {
+  return selectExtractionRows(
+    request.rows,
+    request.types,
+    request.messages.map((message) => message.content).join("\n"),
+    request.batch.mode === "cleaning" ? void 0 : request.contextPolicy
+  );
+}
 function extractionRuntimeInput(request) {
   const referenceById = new Map([...extractionRowReferences(request.rows)].map(([ref, id]) => [id, ref]));
-  const selected = selectExtractionRows(request.rows, request.types, request.messages.map((message) => message.content).join("\n"), request.contextPolicy);
+  const selected = extractionContextRows(request);
   return {
     ...request.contextPolicy?.enabled ? {
       entityDirectory: request.rows.map((row) => ({
@@ -20309,11 +20323,11 @@ function duplicateDataName(rows, typeId, dataName, exceptRowId) {
     (row) => row.typeId === typeId && row.id !== exceptRowId && row.dataName.trim().toLocaleLowerCase() === normalized
   );
 }
-function validateOperation(operation, types, rows, messageIds, initialRows) {
+function validateOperation(operation, types, rows, messageIds, initialRows, identityRows = rows) {
   const type = types.get(operation.typeId);
   if (!type) throw new Error(`Operation references an unavailable type: ${operation.typeId}`);
   if (operation.action === "add") {
-    if (duplicateDataName(rows, type.id, operation.dataName)) {
+    if (duplicateDataName(identityRows, type.id, operation.dataName)) {
       throw new Error(`Data name already exists in ${type.name}: ${operation.dataName}`);
     }
     const values = validateMemoryValues(type.columns, operation.values);
@@ -20344,7 +20358,7 @@ function validateOperation(operation, types, rows, messageIds, initialRows) {
     return;
   }
   const dataName = operation.changes.dataName ?? current.dataName;
-  if (duplicateDataName(rows, type.id, dataName, current.id)) {
+  if (duplicateDataName(identityRows, type.id, dataName, current.id)) {
     throw new Error(`Data name already exists in ${type.name}: ${dataName}`);
   }
   const mergedValues = {
@@ -20402,12 +20416,7 @@ var ExtractionService = class {
     const types = new Map(request.types.map((type) => [type.id, type]));
     const simulatedRows = structuredClone(request.rows);
     const rowReferences = extractionRowReferences(request.rows);
-    const selectedRows = selectExtractionRows(
-      request.rows,
-      request.types,
-      request.messages.map((message) => message.content).join("\n"),
-      request.contextPolicy
-    ).rows;
+    const selectedRows = extractionContextRows(request).rows;
     const messageIds = request.messages.map((message) => message.id);
     const providerMessages = buildExtractionMessages(request);
     context.report(0.1, "Waiting for secondary API");
@@ -20459,27 +20468,32 @@ var ExtractionService = class {
     const operations = [];
     const rejectedOperations = [];
     const reviewItems = [];
-    for (const [index, candidate] of rawOperations.entries()) {
+    const proposed = rawOperations.map((candidate) => {
       const parsed = parseOperation(candidate);
-      if (!parsed.operation) {
-        const reason = parsed.reason ?? "Invalid extraction operation.";
+      const operation = parsed.operation?.action === "add" ? parsed.operation : parsed.operation ? {
+        ...parsed.operation,
+        rowId: rowReferences.get(parsed.operation.rowId) ?? parsed.operation.rowId
+      } : void 0;
+      return { candidate, operation, reason: parsed.reason };
+    });
+    const deletedRowIds = new Set(request.batch.mode === "cleaning" ? proposed.flatMap(({ operation }) => operation?.action === "delete" && types.has(operation.typeId) && selectedRows.some((row) => row.id === operation.rowId && row.typeId === operation.typeId) ? [operation.rowId] : []) : []);
+    for (const [index, { candidate, operation, reason: parseReason }] of proposed.entries()) {
+      if (!operation) {
+        const reason = parseReason ?? "Invalid extraction operation.";
         rejectedOperations.push({ operation: candidate, reason });
         reviewItems.push({ index, state: "rejected", operation: candidate, reason });
         continue;
       }
-      const operation = parsed.operation.action === "add" ? parsed.operation : {
-        ...parsed.operation,
-        rowId: rowReferences.get(parsed.operation.rowId) ?? parsed.operation.rowId
-      };
       try {
         const attributes = operation.action === "add" ? operation.continuity : operation.action === "update" ? operation.changes.continuity : void 0;
         if (attributes && !request.extractAttributes) throw new Error("\u65F6\u95F4\u4E0E\u8BA4\u77E5\u5C5E\u6027\u63D0\u53D6\u672A\u542F\u7528\u3002");
         if (operation.action !== "add" && request.contextPolicy?.enabled && !selectedRows.some((row) => row.id === operation.rowId)) {
           throw new Error("\u8BE5\u8BB0\u5F55\u672A\u63D0\u4F9B\u5B8C\u6574\u8BE6\u60C5\uFF1B\u8BF7\u6269\u5927\u5199\u8868\u4E0A\u4E0B\u6587\u6216\u624B\u52A8\u5904\u7406\uFF0C\u672A\u4FEE\u6539\u6216\u5220\u9664\u8BE5\u8BB0\u5F55\u3002");
         }
+        const identityRows = deletedRowIds.size ? simulatedRows.filter((row) => !deletedRowIds.has(row.id)) : simulatedRows;
         const name = operation.action === "add" ? operation.dataName : operation.action === "update" ? operation.changes.dataName : void 0;
         if (name && extractionNameCollision(
-          simulatedRows,
+          identityRows,
           request.types,
           operation.typeId,
           name,
@@ -20489,13 +20503,13 @@ var ExtractionService = class {
         }
         const aliases = operation.action === "add" ? operation.aliases : operation.action === "update" ? operation.changes.aliases : void 0;
         if (aliases?.some((alias) => extractionNameCollision(
-          simulatedRows,
+          identityRows,
           request.types,
           operation.typeId,
           alias,
           operation.action === "update" ? operation.rowId : void 0
         ))) throw new Error("\u522B\u540D\u4E0E\u5DF2\u6709\u5B9E\u4F53\u51B2\u7A81\uFF0C\u8BF7\u4EBA\u5DE5\u6838\u5BF9\uFF0C\u672A\u81EA\u52A8\u5408\u5E76\u3002");
-        validateOperation(operation, types, simulatedRows, messageIds, request.rows);
+        validateOperation(operation, types, simulatedRows, messageIds, request.rows, identityRows);
         operations.push(operation);
         reviewItems.push({ index, state: "valid", operation });
       } catch (error51) {

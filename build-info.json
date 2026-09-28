@@ -1,7 +1,7 @@
 {
   "service": "echoes-memory",
-  "appVersion": "3.2.5",
+  "appVersion": "3.2.6",
   "apiProtocolVersion": 2,
-  "builtAt": "2026-09-27T18:23:30.000Z",
-  "productionLockSha256": "4457ad8875f0fdfae98b836f264d12945a4016b06d4a7ce84ece20cf5685d35c"
+  "builtAt": "2026-09-28T12:53:02.000Z",
+  "productionLockSha256": "885ded22687267a9466385d24eca2f369d9936c0833cfa1f1cd0d6555e502f32"
 }
