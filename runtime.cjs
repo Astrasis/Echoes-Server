@@ -14873,6 +14873,26 @@ var statusVariablesSchema = listSchema.superRefine((variables, ctx) => {
   }
 });
 
+// src/shared/creative-preferences.ts
+var creativePreferenceSchema = external_exports.object({
+  id: external_exports.string().min(1).max(120),
+  title: external_exports.string().trim().min(1).max(120),
+  category: external_exports.enum(["expression", "pace", "boundary", "other"]),
+  rule: external_exports.string().trim().min(1).max(5e3),
+  condition: external_exports.string().max(2e3),
+  source: external_exports.string().max(2e3),
+  confirmed: external_exports.boolean(),
+  enabled: external_exports.boolean(),
+  updatedAt: external_exports.string().datetime()
+}).strict();
+var creativePreferencesSchema = external_exports.object({
+  enabled: external_exports.boolean(),
+  rules: external_exports.array(creativePreferenceSchema).max(100)
+}).strict().superRefine((value, ctx) => {
+  if (new Set(value.rules.map((rule) => rule.id)).size !== value.rules.length)
+    ctx.addIssue({ code: "custom", path: ["rules"], message: "\u521B\u4F5C\u504F\u597D ID \u4E0D\u5F97\u91CD\u590D\u3002" });
+});
+
 // src/shared/domain.ts
 var MEMORY_COLUMN_TYPES = [
   "text",
@@ -15070,6 +15090,7 @@ var promptPresetSchema = external_exports.object({
   updatedAt: external_exports.string().datetime()
 });
 var structuredMemoryCatalogSchema = external_exports.object({
+  creativePreferences: creativePreferencesSchema.optional(),
   formatVersion: external_exports.literal(1),
   chatId: external_exports.string().trim().min(1).max(240),
   types: external_exports.array(memoryTypeDefinitionSchema).max(80),
@@ -15300,6 +15321,11 @@ var summaryPreprocessRuleSchema = external_exports.object({
   pattern: external_exports.string().min(1).max(2e3),
   flags: external_exports.string().regex(/^[dgimsuvy]*$/).max(8).default("g"),
   replacement: external_exports.string().max(1e4).default(""),
+  extraction: external_exports.object({
+    mode: external_exports.enum(["auto", "match", "group"]),
+    group: external_exports.number().int().min(1).max(99),
+    separator: external_exports.string().max(200)
+  }).optional(),
   roles: external_exports.array(external_exports.enum(["user", "assistant"])).min(1).max(2),
   enabled: external_exports.boolean().default(true),
   order: external_exports.number().int().min(0).max(1e3)
@@ -15416,6 +15442,7 @@ var summaryCatalogSchema = external_exports.object({
   chatId: external_exports.string().trim().min(1).max(240),
   namespaceId: identifierSchema,
   autoRun: external_exports.boolean(),
+  automaticStopMessageId: external_exports.string().min(1).max(240).optional(),
   recallEnabled: external_exports.boolean().default(false),
   recallSourceWeight: external_exports.number().min(0).max(10).default(0),
   recallSourceAddWeight: external_exports.number().min(-1).max(1).default(0),
@@ -16326,11 +16353,39 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "3.2.7", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "3.3.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
 }
+
+// src/shared/discussion.ts
+var DEFAULT_DISCUSSION_SYSTEM_PROMPT = `\u73B0\u5728\u6682\u505C\u5267\u60C5\u6F14\u7ECE\uFF0C\u8FDB\u5165\u5267\u60C5\u8BA8\u8BBA\u6A21\u5F0F\u3002\u4EE5\u4E2D\u6587\u4E0E\u7528\u6237\u8BA8\u8BBA\u521B\u4F5C\uFF0C\u800C\u4E0D\u662F\u7EE7\u7EED\u626E\u6F14\u4EBA\u7269\u6216\u63A8\u8FDB\u6545\u4E8B\u3002
+\u524D\u9762\u7684\u89D2\u8272\u8D44\u6599\u3001\u4E16\u754C\u8BBE\u5B9A\u3001\u8BB0\u5FC6\u4E0E\u804A\u5929\u662F\u8BA8\u8BBA\u80CC\u666F\u3002\u7528\u6237\u901A\u5E38\u662F\u4E3B\u6301\u4EBA\uFF0C\u626E\u6F14\u4E16\u754C\u4E0E\u5176\u4ED6\u4EBA\u7269\uFF0C\u4E0D\u5E94\u9ED8\u8BA4\u628A\u7528\u6237\u5F53\u4F5C\u4E16\u754C\u5185\u540D\u53EB\u201CUser\u201D\u7684\u4EBA\u7269\u3002
+\u533A\u5206\u5DF2\u7ECF\u53D1\u751F\u7684\u4E8B\u5B9E\u3001\u89D2\u8272\u76EE\u524D\u7684\u8BA4\u77E5\u3001\u5C1A\u672A\u63ED\u9732\u7684\u8BBE\u5B9A\u4E0E\u53EF\u4EE5\u9009\u62E9\u7684\u521B\u4F5C\u65B9\u6848\uFF1B\u6CA1\u6709\u4F9D\u636E\u65F6\u660E\u786E\u8BF4\u660E\u672A\u77E5\uFF0C\u4E0D\u8981\u628A\u731C\u6D4B\u5199\u6210\u65E2\u5B9A\u4E8B\u5B9E\uFF0C\u4E5F\u4E0D\u8981\u8BA9\u89D2\u8272\u81EA\u52A8\u83B7\u5F97\u80CC\u666F\u4E2D\u7684\u5168\u90E8\u77E5\u8BC6\u3002
+\u56F4\u7ED5\u7528\u6237\u672C\u6B21\u63D0\u51FA\u7684\u95EE\u9898\u4F5C\u7B54\uFF0C\u53EF\u4EE5\u5206\u6790\u4EBA\u7269\u52A8\u673A\u3001\u60C5\u611F\u4E0E\u5173\u7CFB\u3001\u56E0\u679C\u3001\u4F0F\u7B14\u3001\u8282\u594F\u3001\u8BBE\u5B9A\u4E00\u81F4\u6027\u53CA\u540E\u7EED\u53D1\u5C55\u7684\u4E0D\u540C\u53EF\u80FD\u3002\u8BA8\u8BBA\u4E2D\u7684\u63D0\u8BAE\u4E0D\u4EE3\u8868\u5267\u60C5\u5DF2\u53D1\u751F\u6216\u7528\u6237\u5DF2\u91C7\u7EB3\uFF0C\u4E0D\u8981\u66F4\u65B0\u8BB0\u5FC6\u3001\u72B6\u6001\u6216\u4EE3\u66FF\u7528\u6237\u51B3\u5B9A\u5267\u60C5\u3002`;
+var discussionSettingsSchema = external_exports.object({
+  systemPrompt: external_exports.string().trim().min(1).max(1e5).default(DEFAULT_DISCUSSION_SYSTEM_PROMPT),
+  presets: external_exports.array(external_exports.object({
+    id: identifierSchema,
+    name: external_exports.string().trim().min(1).max(200),
+    content: external_exports.string().trim().min(1).max(1e5)
+  }).strict()).max(200).default([])
+}).strict().refine(
+  (value) => new Set(value.presets.map((preset) => preset.id)).size === value.presets.length,
+  "\u5267\u60C5\u8BA8\u8BBA\u9884\u8BBE ID \u4E0D\u80FD\u91CD\u590D\u3002"
+);
+var discussionMessageSchema = external_exports.object({
+  role: external_exports.enum(["system", "developer", "user", "assistant", "tool", "function"]),
+  content: external_exports.union([external_exports.string(), external_exports.array(external_exports.unknown()), external_exports.null()]).optional()
+}).passthrough();
+var discussionRequestSchema = external_exports.object({
+  chatId: external_exports.string().min(1).max(1e3),
+  messages: external_exports.array(discussionMessageSchema).min(3).max(2e4),
+  generationGroup: generationEndpointGroupSchema,
+  failoverPolicy: failoverPolicySchema,
+  resumeAfterEndpointId: identifierSchema.optional()
+}).strict();
 
 // src/server/http/routes.ts
 function errorStatus(error51) {
@@ -16405,6 +16460,63 @@ function registerRoutes(options) {
   router.get("/health", (_request, response) => {
     response.json({ ok: true, build: ECHOES_SERVER_BUILD_INFO });
   });
+  router.post("/discussion/generate", route(async (request, response) => {
+    const input = discussionRequestSchema.parse(request.body);
+    const runtime = await runtimes2.forRequest(request);
+    if (response.destroyed) return;
+    let jobId;
+    let disconnected = false;
+    const send = (event) => {
+      if (!disconnected && !response.writableEnded) response.write(JSON.stringify(event) + "\n");
+    };
+    const disconnect = () => {
+      disconnected = true;
+      if (jobId) void runtime.jobs.cancel(jobId).catch((error51) => {
+        console.error("[Echoes] Failed to cancel disconnected discussion.", error51);
+      });
+    };
+    response.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    response.setHeader("Cache-Control", "no-cache, no-transform");
+    response.setHeader("X-Accel-Buffering", "no");
+    response.on("close", disconnect);
+    const heartbeat = setInterval(() => send({ type: "heartbeat" }), 15e3);
+    try {
+      const job = await runtime.jobs.create("plot-discussion", (context) => {
+        if (disconnected || response.destroyed) throw new Error("Discussion client disconnected before generation.");
+        return runtime.generationService.discuss(input, context, send);
+      }, { lane: "interactive" });
+      jobId = job.id;
+      if (disconnected) {
+        await runtime.jobs.cancel(jobId);
+        return;
+      }
+      send({ type: "job", jobId });
+      while (!disconnected) {
+        const current = runtime.jobs.get(jobId);
+        if (!current) throw new Error("\u5267\u60C5\u8BA8\u8BBA\u4EFB\u52A1\u4E0D\u5B58\u5728\u3002");
+        if (current.status === "succeeded" && current.result) {
+          send({ type: "result", result: current.result });
+          break;
+        }
+        if (["failed", "ambiguous", "cancelled"].includes(current.status)) {
+          send({
+            type: "error",
+            message: current.error?.message ?? current.message,
+            cancelled: current.status === "cancelled"
+          });
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    } catch (error51) {
+      if (jobId) await runtime.jobs.cancel(jobId);
+      send({ type: "error", message: error51 instanceof Error ? error51.message : String(error51) });
+    } finally {
+      clearInterval(heartbeat);
+      response.off("close", disconnect);
+      response.end();
+    }
+  }));
   router.get(
     "/system/status",
     route(async (request, response) => {
@@ -19712,7 +19824,8 @@ function extractionRuntimeInput(request) {
         type: column.type,
         required: column.required,
         description: column.description ?? "",
-        enumValues: column.enumValues ?? []
+        enumValues: column.enumValues ?? [],
+        ...column.defaultValue === void 0 ? {} : { defaultValue: column.defaultValue }
       }))
     })),
     currentRows: selected.rows.map((row) => ({
@@ -19958,6 +20071,7 @@ async function requestStructuredCompletion(options) {
           const event = parseEventLine(line);
           usage = event.usage ?? usage;
           content += event.content;
+          if (event.content) options.onDelta?.(event.content);
           if (event.done) {
             completed = true;
             break;
@@ -19970,6 +20084,7 @@ async function requestStructuredCompletion(options) {
         const event = parseEventLine(buffer);
         usage = event.usage ?? usage;
         content += event.content;
+        if (event.content) options.onDelta?.(event.content);
         completed ||= event.done;
       }
     } finally {
@@ -20226,15 +20341,44 @@ var GenerationService = class {
       health: this.health,
       signal: options.context.signal,
       resolveEndpoint: this.resolveEndpoint,
-      invoke: (endpoint) => requestStructuredCompletion({
-        config: endpoint,
-        messages: options.messages,
-        signal: options.context.signal,
-        onProgress: (characters) => options.context.report(
-          Math.min(0.75, 0.1 + characters / 1e5),
-          `Receiving model output (${characters} chars)`
-        )
-      })
+      invoke: (endpoint) => {
+        options.onDiscussionEvent?.({ type: "endpoint", name: endpoint.name, streaming: endpoint.streaming });
+        return requestStructuredCompletion({
+          config: options.workflow === "discussion" ? { ...endpoint, jsonMode: false } : endpoint,
+          messages: options.messages,
+          signal: options.context.signal,
+          onProgress: (characters) => options.context.report(
+            Math.min(0.75, 0.1 + characters / 1e5),
+            `Receiving model output (${characters} chars)`
+          ),
+          onDelta: options.onDiscussionEvent ? (text) => options.onDiscussionEvent({ type: "delta", text }) : void 0
+        });
+      }
+    });
+  }
+  async discuss(request, context, onEvent) {
+    const result = await this.run({
+      workflow: "discussion",
+      group: request.generationGroup,
+      policy: request.failoverPolicy,
+      resumeAfterEndpointId: request.resumeAfterEndpointId,
+      messages: request.messages,
+      context,
+      onDiscussionEvent: onEvent
+    });
+    if (result.state === "succeeded") {
+      return { outcome: "completed", text: result.value, attempts: result.attempts };
+    }
+    if (result.decisionRequired) {
+      return {
+        outcome: "decision_required",
+        attempts: result.attempts,
+        decisionRequired: result.decisionRequired,
+        message: result.message
+      };
+    }
+    throw Object.assign(new Error(result.message ?? "\u5267\u60C5\u8BA8\u8BBA\u751F\u6210\u5931\u8D25\u3002"), {
+      code: result.state === "ambiguous" ? "AMBIGUOUS_PROVIDER_OUTCOME" : "DISCUSSION_FAILED"
     });
   }
   async listModels(input, context) {
