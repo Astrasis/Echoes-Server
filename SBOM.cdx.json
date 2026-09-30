@@ -3962,7 +3962,7 @@
         "@lancedb/lancedb@0.31.0",
         "ipaddr.js@2.2.0"
       ],
-      "ref": "echoes-memory-server@3.3.0"
+      "ref": "echoes-memory-server@3.3.1"
     },
     {
       "dependsOn": [
@@ -4595,7 +4595,7 @@
   ],
   "metadata": {
     "component": {
-      "bom-ref": "echoes-memory-server@3.3.0",
+      "bom-ref": "echoes-memory-server@3.3.1",
       "externalReferences": [],
       "licenses": [
         {
@@ -4611,17 +4611,17 @@
           "value": "true"
         }
       ],
-      "purl": "pkg:npm/echoes-memory-server@3.3.0",
+      "purl": "pkg:npm/echoes-memory-server@3.3.1",
       "scope": "required",
       "type": "application",
-      "version": "3.3.0"
+      "version": "3.3.1"
     },
     "lifecycles": [
       {
         "phase": "pre-build"
       }
     ],
-    "timestamp": "2026-09-29T21:35:12.000Z",
+    "timestamp": "2026-09-30T09:10:23.000Z",
     "tools": [
       {
         "name": "cli",
@@ -4630,7 +4630,7 @@
       }
     ]
   },
-  "serialNumber": "urn:uuid:2a88a19a-4116-8072-8260-cc7562f5f928",
+  "serialNumber": "urn:uuid:f7411803-4996-8450-8388-c5be0d9b5186",
   "specVersion": "1.5",
   "version": 1
 }
