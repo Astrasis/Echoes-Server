@@ -14612,8 +14612,11 @@ var CONTINUITY_EXTRACTION_GUIDE = `\u5DF2\u5F00\u542F\u65F6\u95F4\u4E0E\u8BA4\u7
 
 \u8BA4\u77E5\u72B6\u6001\u9488\u5BF9\u5177\u4F53\u8BF4\u6CD5\uFF0C\u800C\u4E0D\u662F\u6574\u4E2A\u573A\u666F\u3002\u540E\u6765\u624D\u5F97\u77E5\u7684\u4FE1\u606F\uFF0C\u4E0D\u7B49\u4E8E\u65E9\u5C31\u77E5\u9053\u3002\u533A\u5206\u5B9E\u9645\u53D1\u751F\u7684\u53D8\u5316\u4E0E\u5BF9\u65E7\u8BB0\u5F55\u7684\u66F4\u6B63\u3002\u7701\u7565\u8FD9\u4E2A\u5BF9\u8C61\u4E0D\u4F1A\u6539\u53D8\u5DF2\u6709\u7684\u5C5E\u6027\u3002
 
+continuity \u76F4\u63A5\u5199\u5728\u5B83\u6240\u5C5E\u7684\u90A3\u4E2A\u5BF9\u8C61\u91CC\uFF0C\u4E0D\u53E6\u5305\u4E00\u5C42\uFF1Aadd \u64CD\u4F5C\u4E2D\u4E0E values \u5E76\u5217\uFF1Bupdate \u64CD\u4F5C\u4E2D\u5199\u5728 changes \u91CC\uFF0C\u4E0E values \u5E76\u5217\uFF1B\u5267\u60C5\u603B\u7ED3\u4E2D\u5199\u5728\u6BCF\u6761\u8BB0\u5F55\u91CC\uFF0C\u4E0E title\u3001content \u5E76\u5217\u3002
+
 \u865A\u6784\u683C\u5F0F\u793A\u4F8B\uFF1A
-{"continuity":{"eventTime":"2087-04","changeKind":"knowledge_change","knowledge":[{"character":"\u6D1B\u79BE","state":"suspected","claim":"\u7F57\u76D8\u7684\u5C01\u6761\u53EF\u80FD\u88AB\u66F4\u6362"}]}}`;
+{"action":"add","typeId":"items","dataName":"\u65E7\u6F6E\u7F57\u76D8","keywords":["\u65E7\u6F6E\u7F57\u76D8"],"values":{"owner":"\u6D1B\u79BE"},"continuity":{"eventTime":"2087-04","validity":"current"}}
+{"action":"update","typeId":"people","rowId":"R1","changes":{"values":{"identity":"\u706F\u5854\u6D4B\u7ED8\u5458"},"continuity":{"changeKind":"knowledge_change","knowledge":[{"character":"\u6D1B\u79BE","state":"suspected","claim":"\u7F57\u76D8\u7684\u5C01\u6761\u53EF\u80FD\u88AB\u66F4\u6362"}]}}}`;
 
 // src/shared/status-variables.ts
 var partNames = { base: "\u57FA\u7840\u503C", extra: "\u989D\u5916\u503C", final: "\u6700\u7EC8\u503C" };
@@ -19816,7 +19819,7 @@ function objectEnd(text, start) {
   return -1;
 }
 function lenientObject(text, start) {
-  let depth = 0;
+  const open = [];
   let inString = false;
   let escaped = false;
   let rewritten = "";
@@ -19836,11 +19839,14 @@ function lenientObject(text, start) {
       else if (char === "	") emitted = "\\t";
     } else if (char === '"') {
       inString = true;
-    } else if (char === "{") {
-      depth += 1;
+    } else if (char === "{" || char === "[") {
+      open.push(char);
+    } else if (char === "]") {
+      open.pop();
     } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return { text: rewritten + char, end: index + 1 };
+      if (open.at(-1) === "[") continue;
+      open.pop();
+      if (open.length === 0) return { text: rewritten + char, end: index + 1 };
     }
     rewritten += emitted;
   }
