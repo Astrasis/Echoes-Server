@@ -19843,7 +19843,8 @@ function parseProviderJsonObject(raw, label, requiredKey) {
   const qualifying = requiredKey ? candidates.filter((candidate) => Object.hasOwn(candidate, requiredKey)) : candidates;
   const value = qualifying.at(-1);
   if (value) return value;
-  throw new Error(candidates.length && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`);
+  const message = candidates.length && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`;
+  throw new Error(`${message} \u56DE\u590D\u957F\u5EA6\uFF1A${raw.length} \u5B57\u7B26\uFF1B\u56DE\u590D\u672B\u5C3E\uFF08\u6700\u591A 200 \u5B57\u7B26\uFF09\uFF1A${raw.slice(-200).replace(/\s+/g, " ").trim()}`);
 }
 
 // src/server/services/extraction-service.ts
@@ -20154,6 +20155,15 @@ function extractContent(payload) {
   const choice = payload.choices?.[0];
   return choice?.delta?.content ?? choice?.message?.content ?? "";
 }
+function rejectTruncatedCompletion(finishReason) {
+  if (finishReason === "length" || finishReason === "max_tokens") {
+    throw new ProviderCallError(
+      `\u6A21\u578B\u56DE\u590D\u56E0\u8F93\u51FA\u957F\u5EA6\u4E0A\u9650\u88AB\u622A\u65AD\uFF08finish_reason: ${finishReason}\uFF09\uFF0C\u7ED3\u679C\u4E0D\u5B8C\u6574\u3002\u8BF7\u51CF\u5C11\u5355\u6279\u6D88\u606F\u6570\uFF0C\u6216\u5728\u4F9B\u5E94\u5546\u4FA7\u63D0\u9AD8\u8F93\u51FA\u4E0A\u9650\u3002`,
+      200,
+      false
+    );
+  }
+}
 function parseEventLine(line) {
   const trimmed = line.trim();
   if (!trimmed.startsWith("data:")) return { content: "", done: false };
@@ -20168,6 +20178,7 @@ function parseEventLine(line) {
   }
   return {
     usage: payload.usage,
+    finishReason: payload.choices?.[0]?.finish_reason,
     content: extractContent(payload),
     done: false
   };
@@ -20177,10 +20188,12 @@ async function readJsonContent(response) {
   try {
     const payload = JSON.parse(raw);
     activeTaskBudget.getStore()?.record(payload);
+    rejectTruncatedCompletion(payload.choices?.[0]?.finish_reason);
     const content = extractContent(payload);
     if (!content.trim()) throw new Error("Provider returned no structured content.");
     return content;
   } catch (error51) {
+    if (error51 instanceof ProviderCallError) throw error51;
     throw new ProviderCallError(
       `Provider returned invalid JSON completion data: ${error51 instanceof Error ? error51.message : String(error51)}`,
       200,
@@ -20246,6 +20259,7 @@ async function requestStructuredCompletion(options) {
     let receivedBytes = 0;
     let completed = false;
     let usage;
+    let finishReason;
     try {
       while (!completed) {
         const { value, done } = await reader.read();
@@ -20261,6 +20275,7 @@ async function requestStructuredCompletion(options) {
         for (const line of lines) {
           const event = parseEventLine(line);
           usage = event.usage ?? usage;
+          finishReason = event.finishReason ?? finishReason;
           content += event.content;
           if (event.content) options.onDelta?.(event.content);
           if (event.done) {
@@ -20274,6 +20289,7 @@ async function requestStructuredCompletion(options) {
       if (!completed && buffer.trim()) {
         const event = parseEventLine(buffer);
         usage = event.usage ?? usage;
+        finishReason = event.finishReason ?? finishReason;
         content += event.content;
         if (event.content) options.onDelta?.(event.content);
         completed ||= event.done;
@@ -20283,6 +20299,7 @@ async function requestStructuredCompletion(options) {
       reader.releaseLock();
     }
     if (usage) activeTaskBudget.getStore()?.record({ usage });
+    rejectTruncatedCompletion(finishReason);
     if (!completed) {
       throw new RetrievalProviderError(
         "The provider stream ended before the OpenAI-compatible [DONE] marker.",
