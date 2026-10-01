@@ -15831,7 +15831,7 @@ var statusProfileSchema = external_exports.object({
   ...statusProfileFields
 }).strict();
 var statusCatalogSchema = external_exports.object({
-  // 4.0.0 only: one-time prompt reset for pre-4.0 settings. Remove in 4.0.1.
+  // Written by 4.0.0 and no longer used; kept so this strict schema still accepts those catalogs.
   promptSet: external_exports.literal(4).optional(),
   formatVersion: external_exports.literal(1),
   chatId: external_exports.string().trim().min(1).max(240),
@@ -16293,7 +16293,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.0.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.0.1", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
