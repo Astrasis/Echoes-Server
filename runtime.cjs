@@ -19815,6 +19815,37 @@ function objectEnd(text, start) {
   }
   return -1;
 }
+function lenientObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let rewritten = "";
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    let emitted = char;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') {
+        let next = index + 1;
+        while (next < text.length && /\s/.test(text.charAt(next))) next += 1;
+        if (next === text.length || ",}]:".includes(text.charAt(next))) inString = false;
+        else emitted = '\\"';
+      } else if (char === "\n") emitted = "\\n";
+      else if (char === "\r") emitted = "\\r";
+      else if (char === "	") emitted = "\\t";
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return { text: rewritten + char, end: index + 1 };
+    }
+    rewritten += emitted;
+  }
+  return void 0;
+}
 function isObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -19833,6 +19864,20 @@ function embeddedObjects(text) {
       if (isObject2(value)) {
         objects.push(value);
         start = text.indexOf("{", end);
+        continue;
+      }
+    }
+    const repaired = lenientObject(text, start);
+    if (repaired) {
+      let value;
+      try {
+        value = JSON.parse(repaired.text);
+      } catch {
+        value = void 0;
+      }
+      if (isObject2(value)) {
+        objects.push(value);
+        start = text.indexOf("{", repaired.end);
         continue;
       }
     }
