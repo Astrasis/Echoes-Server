@@ -16303,7 +16303,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.1.3", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.1.4", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -18040,6 +18040,8 @@ var RetrievalService = class {
   }
   async rebuild(options, context) {
     await this.assertCollectionCompatibility(options.collectionIds, options.embeddingGroup);
+    context.report(0.02, "Checking vector identity and completeness");
+    await this.store.reconcileVectorState(options.collectionIds, context.signal);
     const stats = await this.listCollectionStats();
     const selectedStats = stats.filter((item) => options.collectionIds.includes(item.collection.id));
     const total = selectedStats.reduce(
@@ -18698,12 +18700,14 @@ var RetrievalStore = class {
         const previous = existing.get(documentId);
         const contentHash = hash2(input.text);
         const sameText = previous?.contentHash === contentHash;
-        const sameDocument = sameText && previous.collectionId === input.collectionId && previous.sourceType === input.sourceType && previous.sourceId === input.sourceId && JSON.stringify(previous.tags) === JSON.stringify(input.tags) && JSON.stringify(previous.metadata) === JSON.stringify(input.metadata);
+        const sameIdentity = previous?.collectionId === input.collectionId && previous.sourceType === input.sourceType && previous.sourceId === input.sourceId;
+        const reusableVector = sameText && sameIdentity;
+        const sameDocument = reusableVector && JSON.stringify(previous.tags) === JSON.stringify(input.tags) && JSON.stringify(previous.metadata) === JSON.stringify(input.metadata);
         const document = {
           ...input,
           documentId,
           contentHash,
-          vectorState: sameText && previous ? previous.vectorState : "pending",
+          vectorState: reusableVector && previous ? previous.vectorState : "pending",
           createdAt: previous?.createdAt ?? now,
           updatedAt: sameDocument && previous ? previous.updatedAt : now
         };
@@ -18711,7 +18715,7 @@ var RetrievalStore = class {
         if (!previous) created += 1;
         else if (sameDocument) unchanged += 1;
         else updated += 1;
-        if (!previous || !sameText || previous.vectorState !== "ready") needsEmbedding.push(document);
+        if (!previous || !reusableVector || previous.vectorState !== "ready") needsEmbedding.push(document);
       }
       const table = await this.documentsTable();
       await table.mergeInsert("document_id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(documents.map(documentRow));
@@ -18719,6 +18723,44 @@ var RetrievalStore = class {
         await this.deleteVectors(needsEmbedding.map((document) => document.documentId));
       }
       return { documents, needsEmbedding, created, updated, unchanged };
+    });
+  }
+  /** Find legacy ready documents whose expected vector is absent or belongs elsewhere.
+   * This only invalidates derived data; embedding remains an explicit index job.
+   */
+  async reconcileVectorState(collectionIds, signal) {
+    return this.serialize(async () => {
+      const collections = new Map((await this.listCollections()).map((item) => [item.id, item]));
+      const documentsTable = await this.documentsTable();
+      let invalidated = 0;
+      for await (const batch of this.documentBatches(collectionIds, 100, ["ready"])) {
+        signal?.throwIfAborted();
+        const valid = /* @__PURE__ */ new Set();
+        const spaces = new Set(batch.map((item) => collections.get(item.collectionId)?.embeddingSpaceId));
+        for (const space of spaces) {
+          if (!space) continue;
+          const vectors = await this.openVectorTable(space);
+          if (!vectors) continue;
+          const expected = new Map(batch.filter((item) => collections.get(item.collectionId)?.embeddingSpaceId === space).map((item) => [item.documentId, item]));
+          const rows = await vectors.query().where(inFilter("document_id", [...expected.keys()])).select(["document_id", "collection_id", "source_id", "content_hash"]).limit(expected.size).toArray();
+          for (const row of rows) {
+            const document = expected.get(String(row.document_id));
+            if (document && document.collectionId === String(row.collection_id) && document.sourceId === String(row.source_id) && document.contentHash === String(row.content_hash)) {
+              valid.add(document.documentId);
+            }
+          }
+        }
+        signal?.throwIfAborted();
+        const stale = batch.filter((item) => !valid.has(item.documentId)).map((item) => item.documentId);
+        if (!stale.length) continue;
+        await documentsTable.update({
+          where: inFilter("document_id", stale),
+          values: { vector_state: "pending", updated_at: (/* @__PURE__ */ new Date()).toISOString() }
+        });
+        await this.deleteVectors(stale);
+        invalidated += stale.length;
+      }
+      return invalidated;
     });
   }
   async markVectorState(documentIds, state) {
@@ -18810,6 +18852,9 @@ var RetrievalStore = class {
   async searchVector(options) {
     const table = await this.openVectorTable(options.embeddingSpaceId);
     if (!table) return [];
+    const collections = new Map((await this.listCollections()).map((item) => [item.id, item]));
+    const allowedCollections = new Set(options.collectionIds);
+    const excludedSources = new Set(options.excludeSourceIds ?? []);
     const filters = [inFilter("collection_id", options.collectionIds)];
     if (options.excludeSourceIds?.length) {
       filters.push(`NOT (${inFilter("source_id", options.excludeSourceIds)})`);
@@ -18820,7 +18865,7 @@ var RetrievalStore = class {
     return rows.flatMap((row) => {
       const record2 = row;
       const document = documents.get(String(record2.document_id));
-      if (!document || document.vectorState !== "ready" || document.contentHash !== String(record2.content_hash)) return [];
+      if (!document || document.vectorState !== "ready" || !allowedCollections.has(document.collectionId) || excludedSources.has(document.sourceId) || document.collectionId !== String(record2.collection_id) || document.sourceId !== String(record2.source_id) || collections.get(document.collectionId)?.embeddingSpaceId !== options.embeddingSpaceId || document.contentHash !== String(record2.content_hash)) return [];
       const distance = Number(record2._distance ?? 1);
       return [{ document, score: Number.isFinite(distance) ? 1 - distance : 0 }];
     });
@@ -19804,38 +19849,80 @@ var import_node_worker_threads = require("node:worker_threads");
 var import_node_path4 = __toESM(require("node:path"), 1);
 
 // src/server/services/provider-json.ts
+var MAX_RESPONSE_CHARACTERS = 16 * 1024 * 1024;
+var MAX_DEPTH = 256;
+var MAX_CANDIDATES = 256;
+var MAX_REPAIRS = 16;
+var ParseBudget = class {
+  remaining;
+  constructor(length) {
+    this.remaining = Math.max(65536, length * 12);
+  }
+  spend(amount = 1) {
+    this.remaining -= amount;
+    if (this.remaining < 0) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u89E3\u6790\u8D85\u8FC7\u626B\u63CF\u9884\u7B97\u3002");
+  }
+};
 function withoutReasoning(value, rules) {
-  const closed = value.replace(businessRegex("reasoningClosed", rules), " ");
-  const unclosed = closed.search(businessRegex("reasoningOpen", rules));
-  return unclosed < 0 ? closed : closed.slice(0, unclosed);
+  if (Object.hasOwn(rules, "reasoningClosed") || Object.hasOwn(rules, "reasoningOpen")) {
+    const closed = value.replace(businessRegex("reasoningClosed", rules), " ");
+    const unclosed = closed.search(businessRegex("reasoningOpen", rules));
+    return unclosed < 0 ? closed : closed.slice(0, unclosed);
+  }
+  const chunks = [];
+  let after = 0;
+  let open;
+  for (const match of value.matchAll(/<(\/?)(thinking|think)>/gi)) {
+    const name = match[2].toLowerCase();
+    if (!open && !match[1]) {
+      chunks.push(value.slice(after, match.index));
+      open = name;
+    } else if (open === name && match[1]) {
+      chunks.push(" ");
+      after = match.index + match[0].length;
+      open = void 0;
+    }
+  }
+  if (!open) chunks.push(value.slice(after));
+  return chunks.join("");
 }
-function objectEnd(text, start) {
-  let depth = 0;
+function objectEnds(text, budget) {
+  const ends = /* @__PURE__ */ new Map();
+  const starts = [];
   let inString = false;
   let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    budget.spend();
     const char = text[index];
     if (inString) {
       if (escaped) escaped = false;
       else if (char === "\\") escaped = true;
       else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
-    } else if (char === "{") {
-      depth += 1;
-    } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return index + 1;
+      continue;
+    }
+    if (char === '"' && starts.length) inString = true;
+    else if (char === "{") {
+      starts.push(index);
+      if (++depth > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "[") {
+      if (starts.length && ++depth > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "]") depth = Math.max(0, depth - 1);
+    else if (char === "}") {
+      const start = starts.pop();
+      if (start !== void 0) ends.set(start, index + 1);
+      depth = starts.length ? Math.max(0, depth - 1) : 0;
     }
   }
-  return -1;
+  return ends;
 }
-function lenientObject(text, start) {
+function lenientObject(text, start, budget) {
   const open = [];
   let inString = false;
   let escaped = false;
   let rewritten = "";
   for (let index = start; index < text.length; index += 1) {
+    budget.spend();
     const char = text[index];
     let emitted = char;
     if (inString) {
@@ -19843,22 +19930,24 @@ function lenientObject(text, start) {
       else if (char === "\\") escaped = true;
       else if (char === '"') {
         let next = index + 1;
-        while (next < text.length && /\s/.test(text.charAt(next))) next += 1;
+        while (next < text.length && /\s/.test(text.charAt(next))) {
+          budget.spend();
+          next += 1;
+        }
         if (next === text.length || ",}]:".includes(text.charAt(next))) inString = false;
         else emitted = '\\"';
       } else if (char === "\n") emitted = "\\n";
       else if (char === "\r") emitted = "\\r";
       else if (char === "	") emitted = "\\t";
-    } else if (char === '"') {
-      inString = true;
-    } else if (char === "{" || char === "[") {
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") {
       open.push(char);
-    } else if (char === "]") {
-      open.pop();
-    } else if (char === "}") {
+      if (open.length > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "]") open.pop();
+    else if (char === "}") {
       if (open.at(-1) === "[") continue;
       open.pop();
-      if (open.length === 0) return { text: rewritten + char, end: index + 1 };
+      if (!open.length) return { text: rewritten + char, end: index + 1 };
     }
     rewritten += emitted;
   }
@@ -19867,72 +19956,53 @@ function lenientObject(text, start) {
 function isObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function embeddedObjects(text) {
-  const objects = [];
-  let start = text.indexOf("{");
-  while (start >= 0) {
-    const end = objectEnd(text, start);
-    if (end > 0) {
-      let value;
-      try {
-        value = JSON.parse(text.slice(start, end));
-      } catch {
-        value = void 0;
-      }
-      if (isObject2(value)) {
-        objects.push(value);
-        start = text.indexOf("{", end);
-        continue;
-      }
-    }
-    const repaired = lenientObject(text, start);
-    if (repaired) {
-      let value;
-      try {
-        value = JSON.parse(repaired.text);
-      } catch {
-        value = void 0;
-      }
-      if (isObject2(value)) {
-        objects.push(value);
-        start = text.indexOf("{", repaired.end);
-        continue;
-      }
-    }
-    start = text.indexOf("{", start + 1);
-  }
-  return objects;
-}
-function failedObjectDiagnostic(text, requiredKey) {
-  let start = text.indexOf("{");
-  while (start >= 0) {
-    const end = objectEnd(text, start);
-    if (end > 0) {
-      const span = text.slice(start, end);
-      if (span.includes(`"${requiredKey}"`)) {
-        try {
-          JSON.parse(span);
-        } catch (error51) {
-          const message = error51.message;
-          const position = message.match(/\bposition (\d+)/);
-          const offset = position ? Number(position[1]) : 0;
-          const excerpt = span.slice(Math.max(0, offset - 30), offset + 30);
-          return ` JSON \u89E3\u6790\u5931\u8D25\uFF1A${message}\uFF1B${position ? "\u9519\u8BEF\u4F4D\u7F6E\u9644\u8FD1" : "\u5BF9\u8C61\u5F00\u5934"}\uFF1A${JSON.stringify(excerpt)}`;
-        }
-      }
-    }
-    start = text.indexOf("{", start + 1);
-  }
-  return "";
-}
 function parseProviderJsonObject(raw, label, requiredKey, rules = {}) {
+  if (raw.length > MAX_RESPONSE_CHARACTERS) throw new Error("\u6A21\u578B\u54CD\u5E94\u8D85\u8FC7 JSON \u89E3\u6790\u957F\u5EA6\u9650\u5236\uFF0816 Mi \u5B57\u7B26\uFF09\u3002");
   const cleaned = withoutReasoning(raw, rules);
-  const candidates = embeddedObjects(cleaned);
-  const qualifying = requiredKey ? candidates.filter((candidate) => Object.hasOwn(candidate, requiredKey)) : candidates;
-  const value = qualifying.at(-1);
+  const budget = new ParseBudget(cleaned.length);
+  const ends = objectEnds(cleaned, budget);
+  let start = cleaned.indexOf("{");
+  let attempts = 0;
+  let repairs = 0;
+  let found = 0;
+  let value;
+  let diagnostic = "";
+  const parse3 = (span) => {
+    budget.spend(span.length * 2);
+    try {
+      const candidate = JSON.parse(span);
+      return isObject2(candidate) ? candidate : void 0;
+    } catch (error51) {
+      if (!diagnostic && requiredKey && span.includes(`"${requiredKey}"`)) {
+        const message2 = error51.message.slice(0, 300);
+        const position = message2.match(/\bposition (\d+)/);
+        const offset = position ? Number(position[1]) : 0;
+        const excerpt = span.slice(Math.max(0, offset - 30), offset + 30);
+        diagnostic = ` JSON \u89E3\u6790\u5931\u8D25\uFF1A${message2}\uFF1B${position ? "\u9519\u8BEF\u4F4D\u7F6E\u9644\u8FD1" : "\u5BF9\u8C61\u5F00\u5934"}\uFF1A${JSON.stringify(excerpt)}`;
+      }
+      return void 0;
+    }
+  };
+  while (start >= 0) {
+    if (++attempts > MAX_CANDIDATES) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5019\u9009\u5BF9\u8C61\u8D85\u8FC7 256 \u4E2A\u3002");
+    let end = ends.get(start);
+    let candidate = end === void 0 ? void 0 : parse3(cleaned.slice(start, end));
+    if (!candidate) {
+      if (++repairs > MAX_REPAIRS) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u4FEE\u590D\u6B21\u6570\u8D85\u8FC7 16 \u6B21\u3002");
+      const repaired = lenientObject(cleaned, start, budget);
+      if (repaired) {
+        candidate = parse3(repaired.text);
+        if (candidate) end = repaired.end;
+      }
+    }
+    if (candidate) {
+      found += 1;
+      if (!requiredKey || Object.hasOwn(candidate, requiredKey)) value = candidate;
+      start = cleaned.indexOf("{", end);
+    } else start = cleaned.indexOf("{", start + 1);
+  }
   if (value) return value;
-  const message = candidates.length && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`;
-  const diagnostic = requiredKey ? failedObjectDiagnostic(cleaned, requiredKey) : "";
+  const message = found && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`;
   throw new Error(`${message} \u56DE\u590D\u957F\u5EA6\uFF1A${raw.length} \u5B57\u7B26\uFF1B\u56DE\u590D\u672B\u5C3E\uFF08\u6700\u591A 200 \u5B57\u7B26\uFF09\uFF1A${raw.slice(-200).replace(/\s+/g, " ").trim()}${diagnostic}`);
 }
 
@@ -20074,7 +20144,7 @@ var taskRules = {
   preview: []
 };
 function needsBusinessWorker(request) {
-  if (request.task === "preview") return true;
+  if (request.task === "preview" || request.task === "provider") return true;
   const rules = request.args.at(-1);
   return !!rules && typeof rules === "object" && taskRules[request.task].some((id) => Object.hasOwn(rules, id));
 }
@@ -20087,39 +20157,32 @@ function executeBusinessTask(request) {
 function runBusinessTask(request, signal) {
   signal?.throwIfAborted();
   if (!needsBusinessWorker(request)) return Promise.resolve(executeBusinessTask(request));
-  const worker = new import_node_worker_threads.Worker(import_node_path4.default.join(__dirname, "business-regex-worker.cjs"), { workerData: request });
+  const worker = new import_node_worker_threads.Worker(import_node_path4.default.join(__dirname, "business-regex-worker.cjs"), {
+    workerData: request,
+    resourceLimits: { maxOldGenerationSizeMb: 128 }
+  });
   return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = () => {
+    const finish = (complete) => {
+      if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       void worker.terminate();
+      complete();
     };
-    const abort = () => {
-      finish();
-      reject(signal?.reason ?? new Error("\u4E1A\u52A1\u6B63\u5219\u5DF2\u53D6\u6D88\u3002"));
-    };
-    const timer = setTimeout(() => {
-      finish();
-      reject(new Error("\u4E1A\u52A1\u6B63\u5219\u6267\u884C\u8D85\u8FC7 2 \u79D2\uFF0C\u5DF2\u7EC8\u6B62\uFF1B\u8BF7\u8C03\u6574\u89C4\u5219\u6216\u6062\u590D\u9ED8\u8BA4\u3002"));
-    }, 2e3);
+    const abort = () => finish(() => reject(signal?.reason ?? new Error("\u4E1A\u52A1\u89E3\u6790\u5DF2\u53D6\u6D88\u3002")));
+    const timer = setTimeout(() => finish(() => reject(new Error("\u4E1A\u52A1\u89E3\u6790\u6267\u884C\u8D85\u8FC7 2 \u79D2\uFF0C\u5DF2\u7EC8\u6B62\u3002"))), 2e3);
     signal?.addEventListener("abort", abort, { once: true });
     worker.once("message", (data) => {
-      finish();
-      if (data.ok) resolve(data.result);
-      else reject(new Error(data.error ?? "\u4E1A\u52A1\u6B63\u5219\u6267\u884C\u5931\u8D25\u3002"));
+      finish(() => {
+        if (data.ok) resolve(data.result);
+        else reject(new Error(data.error ?? "\u4E1A\u52A1\u89E3\u6790\u6267\u884C\u5931\u8D25\u3002"));
+      });
     });
-    worker.once("error", (error51) => {
-      finish();
-      reject(error51);
-    });
-    worker.once("exit", () => {
-      if (!settled) {
-        finish();
-        reject(new Error("\u4E1A\u52A1\u6B63\u5219\u7EBF\u7A0B\u63D0\u524D\u7ED3\u675F\u3002"));
-      }
-    });
+    worker.once("error", (error51) => finish(() => reject(error51)));
+    worker.once("exit", () => finish(() => reject(new Error("\u4E1A\u52A1\u89E3\u6790\u7EBF\u7A0B\u63D0\u524D\u7ED3\u675F\u3002"))));
+    if (signal?.aborted) abort();
   });
 }
 function parseConfiguredProviderJson(raw, label, requiredKey, rules = {}, signal) {
@@ -20756,7 +20819,7 @@ var GenerationService = class {
     }
     context.report(0.9, "\u54CD\u5E94\u8BFB\u53D6\u5B8C\u6210\uFF0C\u6B63\u5728\u89E3\u6790\u6D4B\u8BD5\u7ED3\u679C");
     try {
-      parseProviderJsonObject(result.value ?? "", "\u7AEF\u70B9\u6D4B\u8BD5");
+      await parseConfiguredProviderJson(result.value ?? "", "\u7AEF\u70B9\u6D4B\u8BD5", void 0, {}, context.signal);
     } catch (error51) {
       throw Object.assign(new Error(`\u7AEF\u70B9\u8FDE\u63A5\u4E0E\u54CD\u5E94\u8BFB\u53D6\u6210\u529F\uFF0C\u4F46\u8F93\u51FA\u89E3\u6790\u5931\u8D25\uFF1A${error51 instanceof Error ? error51.message : String(error51)}`), {
         statusCode: 502,

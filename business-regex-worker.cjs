@@ -14577,38 +14577,80 @@ function declaredAliases(row, types, rules = {}) {
 }
 
 // src/server/services/provider-json.ts
+var MAX_RESPONSE_CHARACTERS = 16 * 1024 * 1024;
+var MAX_DEPTH = 256;
+var MAX_CANDIDATES = 256;
+var MAX_REPAIRS = 16;
+var ParseBudget = class {
+  remaining;
+  constructor(length) {
+    this.remaining = Math.max(65536, length * 12);
+  }
+  spend(amount = 1) {
+    this.remaining -= amount;
+    if (this.remaining < 0) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u89E3\u6790\u8D85\u8FC7\u626B\u63CF\u9884\u7B97\u3002");
+  }
+};
 function withoutReasoning(value, rules) {
-  const closed = value.replace(businessRegex("reasoningClosed", rules), " ");
-  const unclosed = closed.search(businessRegex("reasoningOpen", rules));
-  return unclosed < 0 ? closed : closed.slice(0, unclosed);
+  if (Object.hasOwn(rules, "reasoningClosed") || Object.hasOwn(rules, "reasoningOpen")) {
+    const closed = value.replace(businessRegex("reasoningClosed", rules), " ");
+    const unclosed = closed.search(businessRegex("reasoningOpen", rules));
+    return unclosed < 0 ? closed : closed.slice(0, unclosed);
+  }
+  const chunks = [];
+  let after = 0;
+  let open;
+  for (const match of value.matchAll(/<(\/?)(thinking|think)>/gi)) {
+    const name = match[2].toLowerCase();
+    if (!open && !match[1]) {
+      chunks.push(value.slice(after, match.index));
+      open = name;
+    } else if (open === name && match[1]) {
+      chunks.push(" ");
+      after = match.index + match[0].length;
+      open = void 0;
+    }
+  }
+  if (!open) chunks.push(value.slice(after));
+  return chunks.join("");
 }
-function objectEnd(text, start) {
-  let depth = 0;
+function objectEnds(text, budget) {
+  const ends = /* @__PURE__ */ new Map();
+  const starts = [];
   let inString = false;
   let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    budget.spend();
     const char = text[index];
     if (inString) {
       if (escaped) escaped = false;
       else if (char === "\\") escaped = true;
       else if (char === '"') inString = false;
-    } else if (char === '"') {
-      inString = true;
-    } else if (char === "{") {
-      depth += 1;
-    } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) return index + 1;
+      continue;
+    }
+    if (char === '"' && starts.length) inString = true;
+    else if (char === "{") {
+      starts.push(index);
+      if (++depth > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "[") {
+      if (starts.length && ++depth > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "]") depth = Math.max(0, depth - 1);
+    else if (char === "}") {
+      const start = starts.pop();
+      if (start !== void 0) ends.set(start, index + 1);
+      depth = starts.length ? Math.max(0, depth - 1) : 0;
     }
   }
-  return -1;
+  return ends;
 }
-function lenientObject(text, start) {
+function lenientObject(text, start, budget) {
   const open = [];
   let inString = false;
   let escaped = false;
   let rewritten = "";
   for (let index = start; index < text.length; index += 1) {
+    budget.spend();
     const char = text[index];
     let emitted = char;
     if (inString) {
@@ -14616,22 +14658,24 @@ function lenientObject(text, start) {
       else if (char === "\\") escaped = true;
       else if (char === '"') {
         let next = index + 1;
-        while (next < text.length && /\s/.test(text.charAt(next))) next += 1;
+        while (next < text.length && /\s/.test(text.charAt(next))) {
+          budget.spend();
+          next += 1;
+        }
         if (next === text.length || ",}]:".includes(text.charAt(next))) inString = false;
         else emitted = '\\"';
       } else if (char === "\n") emitted = "\\n";
       else if (char === "\r") emitted = "\\r";
       else if (char === "	") emitted = "\\t";
-    } else if (char === '"') {
-      inString = true;
-    } else if (char === "{" || char === "[") {
+    } else if (char === '"') inString = true;
+    else if (char === "{" || char === "[") {
       open.push(char);
-    } else if (char === "]") {
-      open.pop();
-    } else if (char === "}") {
+      if (open.length > MAX_DEPTH) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5D4C\u5957\u8D85\u8FC7 256 \u5C42\u3002");
+    } else if (char === "]") open.pop();
+    else if (char === "}") {
       if (open.at(-1) === "[") continue;
       open.pop();
-      if (open.length === 0) return { text: rewritten + char, end: index + 1 };
+      if (!open.length) return { text: rewritten + char, end: index + 1 };
     }
     rewritten += emitted;
   }
@@ -14640,72 +14684,53 @@ function lenientObject(text, start) {
 function isObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function embeddedObjects(text) {
-  const objects = [];
-  let start = text.indexOf("{");
-  while (start >= 0) {
-    const end = objectEnd(text, start);
-    if (end > 0) {
-      let value;
-      try {
-        value = JSON.parse(text.slice(start, end));
-      } catch {
-        value = void 0;
-      }
-      if (isObject2(value)) {
-        objects.push(value);
-        start = text.indexOf("{", end);
-        continue;
-      }
-    }
-    const repaired = lenientObject(text, start);
-    if (repaired) {
-      let value;
-      try {
-        value = JSON.parse(repaired.text);
-      } catch {
-        value = void 0;
-      }
-      if (isObject2(value)) {
-        objects.push(value);
-        start = text.indexOf("{", repaired.end);
-        continue;
-      }
-    }
-    start = text.indexOf("{", start + 1);
-  }
-  return objects;
-}
-function failedObjectDiagnostic(text, requiredKey) {
-  let start = text.indexOf("{");
-  while (start >= 0) {
-    const end = objectEnd(text, start);
-    if (end > 0) {
-      const span = text.slice(start, end);
-      if (span.includes(`"${requiredKey}"`)) {
-        try {
-          JSON.parse(span);
-        } catch (error51) {
-          const message = error51.message;
-          const position = message.match(/\bposition (\d+)/);
-          const offset = position ? Number(position[1]) : 0;
-          const excerpt = span.slice(Math.max(0, offset - 30), offset + 30);
-          return ` JSON \u89E3\u6790\u5931\u8D25\uFF1A${message}\uFF1B${position ? "\u9519\u8BEF\u4F4D\u7F6E\u9644\u8FD1" : "\u5BF9\u8C61\u5F00\u5934"}\uFF1A${JSON.stringify(excerpt)}`;
-        }
-      }
-    }
-    start = text.indexOf("{", start + 1);
-  }
-  return "";
-}
 function parseProviderJsonObject(raw, label, requiredKey, rules = {}) {
+  if (raw.length > MAX_RESPONSE_CHARACTERS) throw new Error("\u6A21\u578B\u54CD\u5E94\u8D85\u8FC7 JSON \u89E3\u6790\u957F\u5EA6\u9650\u5236\uFF0816 Mi \u5B57\u7B26\uFF09\u3002");
   const cleaned = withoutReasoning(raw, rules);
-  const candidates = embeddedObjects(cleaned);
-  const qualifying = requiredKey ? candidates.filter((candidate) => Object.hasOwn(candidate, requiredKey)) : candidates;
-  const value = qualifying.at(-1);
+  const budget = new ParseBudget(cleaned.length);
+  const ends = objectEnds(cleaned, budget);
+  let start = cleaned.indexOf("{");
+  let attempts = 0;
+  let repairs = 0;
+  let found = 0;
+  let value;
+  let diagnostic = "";
+  const parse3 = (span) => {
+    budget.spend(span.length * 2);
+    try {
+      const candidate = JSON.parse(span);
+      return isObject2(candidate) ? candidate : void 0;
+    } catch (error51) {
+      if (!diagnostic && requiredKey && span.includes(`"${requiredKey}"`)) {
+        const message2 = error51.message.slice(0, 300);
+        const position = message2.match(/\bposition (\d+)/);
+        const offset = position ? Number(position[1]) : 0;
+        const excerpt = span.slice(Math.max(0, offset - 30), offset + 30);
+        diagnostic = ` JSON \u89E3\u6790\u5931\u8D25\uFF1A${message2}\uFF1B${position ? "\u9519\u8BEF\u4F4D\u7F6E\u9644\u8FD1" : "\u5BF9\u8C61\u5F00\u5934"}\uFF1A${JSON.stringify(excerpt)}`;
+      }
+      return void 0;
+    }
+  };
+  while (start >= 0) {
+    if (++attempts > MAX_CANDIDATES) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u5019\u9009\u5BF9\u8C61\u8D85\u8FC7 256 \u4E2A\u3002");
+    let end = ends.get(start);
+    let candidate = end === void 0 ? void 0 : parse3(cleaned.slice(start, end));
+    if (!candidate) {
+      if (++repairs > MAX_REPAIRS) throw new Error("\u6A21\u578B\u54CD\u5E94 JSON \u4FEE\u590D\u6B21\u6570\u8D85\u8FC7 16 \u6B21\u3002");
+      const repaired = lenientObject(cleaned, start, budget);
+      if (repaired) {
+        candidate = parse3(repaired.text);
+        if (candidate) end = repaired.end;
+      }
+    }
+    if (candidate) {
+      found += 1;
+      if (!requiredKey || Object.hasOwn(candidate, requiredKey)) value = candidate;
+      start = cleaned.indexOf("{", end);
+    } else start = cleaned.indexOf("{", start + 1);
+  }
   if (value) return value;
-  const message = candidates.length && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`;
-  const diagnostic = requiredKey ? failedObjectDiagnostic(cleaned, requiredKey) : "";
+  const message = found && requiredKey ? `${label}\u54CD\u5E94\u4E2D\u7684 JSON \u5BF9\u8C61\u90FD\u7F3A\u5C11 "${requiredKey}" \u5B57\u6BB5\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u683C\u5F0F\u4E0D\u7B26\u3002` : `${label}\u54CD\u5E94\u4E2D\u6CA1\u6709\u627E\u5230\u5B8C\u6574\u7684 JSON \u5BF9\u8C61\uFF1B\u56DE\u590D\u53EF\u80FD\u88AB\u622A\u65AD\u6216\u4E0D\u542B JSON\u3002`;
   throw new Error(`${message} \u56DE\u590D\u957F\u5EA6\uFF1A${raw.length} \u5B57\u7B26\uFF1B\u56DE\u590D\u672B\u5C3E\uFF08\u6700\u591A 200 \u5B57\u7B26\uFF09\uFF1A${raw.slice(-200).replace(/\s+/g, " ").trim()}${diagnostic}`);
 }
 
