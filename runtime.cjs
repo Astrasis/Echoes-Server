@@ -21506,7 +21506,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.1.8", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.1.9", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -22790,6 +22790,15 @@ var ProviderResponseTooLargeError = class extends Error {
   }
   limit;
 };
+var ProviderResponseProtocolError = class extends Error {
+  constructor(status) {
+    super(`Provider returned an invalid HTTP response${status === void 0 ? "." : ` (status ${status}).`}`);
+    this.status = status;
+    this.name = "ProviderResponseProtocolError";
+  }
+  status;
+  code = "INVALID_PROVIDER_HTTP_RESPONSE";
+};
 function networkErrorCode(error62) {
   const direct = error62?.code;
   if (typeof direct === "string") return direct;
@@ -22834,31 +22843,71 @@ function pinnedRequest(target, options) {
         }
       }
     };
+    let responseStream;
+    let settled = false;
+    let failed = false;
+    const cleanup = () => options.signal.removeEventListener("abort", abort);
+    const fail = (error62) => {
+      if (failed) return;
+      failed = true;
+      cleanup();
+      responseStream?.destroy(error62);
+      request.destroy(error62);
+      if (!settled) {
+        settled = true;
+        reject(error62);
+      }
+    };
+    const abort = () => fail(options.signal.reason instanceof Error ? options.signal.reason : new Error("Provider request was cancelled."));
     const request = (target.url.protocol === "https:" ? import_node_https.request : import_node_http.request)(
       requestOptions,
       (incoming) => {
-        const status = incoming.statusCode ?? 500;
-        const noBody = status === 204 || status === 205 || status === 304;
-        const body = noBody ? null : import_node_stream.Readable.toWeb(incoming);
-        resolve(new Response(body, {
-          status,
-          ...incoming.statusMessage ? { statusText: incoming.statusMessage } : {},
-          headers: responseHeaders(incoming.headers)
-        }));
-        incoming.once("close", () => {
-          options.signal.removeEventListener("abort", abort);
-        });
+        responseStream = incoming;
+        incoming.once("error", fail);
+        incoming.once("close", cleanup);
+        if (failed) {
+          incoming.destroy();
+          return;
+        }
+        const status = incoming.statusCode;
+        try {
+          if (status === void 0 || !Number.isInteger(status) || status < 200 || status > 599) {
+            throw new ProviderResponseProtocolError(status);
+          }
+          const noBody = status === 204 || status === 205 || status === 304;
+          const headers = responseHeaders(incoming.headers);
+          const body = noBody ? null : import_node_stream.Readable.toWeb(incoming);
+          const response = new Response(body, {
+            status,
+            ...incoming.statusMessage ? { statusText: incoming.statusMessage } : {},
+            headers
+          });
+          if (noBody) incoming.destroy();
+          settled = true;
+          resolve(response);
+        } catch {
+          fail(new ProviderResponseProtocolError(status));
+        }
       }
     );
-    const abort = () => request.destroy(
-      options.signal.reason instanceof Error ? options.signal.reason : new Error("Provider request was cancelled.")
-    );
-    options.signal.addEventListener("abort", abort, { once: true });
-    request.once("error", (error62) => {
-      options.signal.removeEventListener("abort", abort);
-      reject(error62);
+    request.once("error", fail);
+    request.once("close", () => {
+      if (!settled) fail(new Error("Provider connection closed before a response was received."));
     });
-    request.end(options.body);
+    request.once("upgrade", (incoming, socket) => {
+      socket.destroy();
+      fail(new ProviderResponseProtocolError(incoming.statusCode));
+    });
+    options.signal.addEventListener("abort", abort, { once: true });
+    if (options.signal.aborted) {
+      abort();
+      return;
+    }
+    try {
+      request.end(options.body);
+    } catch (error62) {
+      fail(error62 instanceof Error ? error62 : new Error("Provider request could not be sent."));
+    }
   });
 }
 async function requestProvider(rawUrl, options, securityOptions = {}) {
@@ -22872,29 +22921,67 @@ async function readResponseTextLimited(response, limit = MAX_PROVIDER_RESPONSE_B
   const decoder = new TextDecoder();
   let received = 0;
   let text = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (value) {
-      received += value.byteLength;
-      if (received > limit) {
-        await reader.cancel().catch(() => void 0);
-        throw new ProviderResponseTooLargeError(limit);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) {
+        received += value.byteLength;
+        if (received > limit) {
+          throw new ProviderResponseTooLargeError(limit);
+        }
+        text += decoder.decode(value, { stream: !done });
       }
-      text += decoder.decode(value, { stream: !done });
+      if (done) break;
     }
-    if (done) break;
+    text += decoder.decode();
+    return text;
+  } finally {
+    await reader.cancel().catch(() => void 0);
+    reader.releaseLock();
   }
-  text += decoder.decode();
-  return text;
 }
 
 // src/server/providers/provider-error.ts
+var MAX_ERROR_CHARACTERS = MAX_PROVIDER_ERROR_BYTES;
+var MAX_REDACTION_SECRETS = 32;
+var OMITTED_DETAIL = "Error details omitted because they exceed the diagnostic safety limit.";
 function redact(value, secrets) {
-  for (const secret of secrets.filter(Boolean)) value = value.replaceAll(secret, "[REDACTED]");
-  return value.replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]").replace(/sk-[a-zA-Z0-9_-]+/g, "[REDACTED]").replace(/((?:api[_-]?key|authorization|password|secret|access[_-]?token)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;<>]+)/gi, "$1[REDACTED]");
+  if (value.length > MAX_ERROR_CHARACTERS || secrets.length > MAX_REDACTION_SECRETS) return null;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    if (secret.length > MAX_ERROR_CHARACTERS) return null;
+    value = value.replaceAll(secret, "[REDACTED]");
+    if (value.length > MAX_ERROR_CHARACTERS) return null;
+  }
+  value = value.replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]").replace(/sk-[a-zA-Z0-9_-]+/g, "[REDACTED]").replace(/((?:api[_-]?key|authorization|password|secret|access[_-]?token)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;<>]+)/gi, "$1[REDACTED]");
+  return value.length <= MAX_ERROR_CHARACTERS ? value : null;
+}
+function stripMarkup(value) {
+  const parts = [];
+  let copiedThrough = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== "<") continue;
+    const start = index;
+    while (index < value.length && value[index] !== ">") index += 1;
+    if (index === value.length) break;
+    parts.push(value.slice(copiedThrough, start), " ");
+    copiedThrough = index + 1;
+  }
+  parts.push(value.slice(copiedThrough));
+  return parts.join("");
+}
+function errorField(value) {
+  if (typeof value === "string" || typeof value === "number") return [String(value)];
+  if (Array.isArray(value) && value.every((item) => typeof item === "string" || typeof item === "number")) {
+    return [value.join(".")];
+  }
+  return [];
 }
 function providerHttpErrorMessage(status, raw, secrets = [], requestId) {
+  const prefix = `Provider returned HTTP ${status}`;
+  if (raw.length > MAX_ERROR_CHARACTERS) return `${prefix}: ${OMITTED_DETAIL}`;
   let detail = "";
+  let plainText = false;
   try {
     const payload = JSON.parse(raw);
     const source = typeof payload?.error === "object" && payload.error !== null ? payload.error : payload;
@@ -22906,13 +22993,22 @@ function providerHttpErrorMessage(status, raw, secrets = [], requestId) {
       source?.path,
       payload?.request_id ?? payload?.requestId
     ];
-    detail = fields.flatMap((value) => typeof value === "string" || typeof value === "number" ? [String(value)] : Array.isArray(value) ? [value.join(".")] : []).join(" \xB7 ");
+    detail = fields.flatMap(errorField).join(" \xB7 ");
   } catch {
-    detail = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    detail = raw;
+    plainText = true;
   }
-  if (requestId) detail += `${detail ? " \xB7 " : ""}request_id=${requestId}`;
-  detail = redact(detail, secrets).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1500);
-  return `Provider returned HTTP ${status}${detail ? `: ${detail}` : "."}`;
+  const masked = redact(detail, secrets);
+  if (masked === null) return `${prefix}: ${OMITTED_DETAIL}`;
+  detail = plainText ? stripMarkup(masked).replace(/\s+/g, " ").trim() : masked;
+  if (requestId) {
+    if (requestId.length > MAX_ERROR_CHARACTERS) return `${prefix}: ${OMITTED_DETAIL}`;
+    detail += `${detail ? " \xB7 " : ""}request_id=${requestId}`;
+  }
+  const safe = redact(detail, secrets);
+  if (safe === null) return `${prefix}: ${OMITTED_DETAIL}`;
+  detail = safe.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1500);
+  return `${prefix}${detail ? `: ${detail}` : "."}`;
 }
 
 // src/server/retrieval/retrieval-provider.ts
@@ -22979,6 +23075,12 @@ async function providerJson(options) {
       throw new RetrievalProviderError(
         `Provider timed out after ${options.endpoint.timeoutMs}ms. The request may still have completed and been billed.`,
         { ambiguous: true, code: "PROVIDER_TIMEOUT" }
+      );
+    }
+    if (error62 instanceof ProviderResponseProtocolError) {
+      throw new RetrievalProviderError(
+        `${error62.message} The request may still have completed and been billed.`,
+        { ambiguous: true, status: error62.status, code: error62.code }
       );
     }
     if (error62 instanceof ProviderResponseTooLargeError) {
@@ -25681,7 +25783,7 @@ async function requestModelCatalog(options) {
     }, {
       allowPrivateNetwork: options.config.allowPrivateNetwork === true
     });
-    const raw = await readResponseTextLimited(response, 4 * 1024 * 1024);
+    const raw = await readResponseTextLimited(response, response.ok ? 4 * 1024 * 1024 : MAX_PROVIDER_ERROR_BYTES);
     if (!response.ok) throw new ProviderCallError(providerHttpErrorMessage(
       response.status,
       raw,
@@ -25784,7 +25886,7 @@ async function requestStructuredCompletion(options) {
       allowPrivateNetwork: config2.allowPrivateNetwork === true
     });
     if (!response.ok) {
-      const raw = await readResponseTextLimited(response, 64 * 1024);
+      const raw = await readResponseTextLimited(response, MAX_PROVIDER_ERROR_BYTES);
       const message = providerHttpErrorMessage(response.status, raw, [config2.apiKey ?? ""], response.headers.get("x-request-id"));
       if (response.status === 504) {
         throw new RetrievalProviderError(
@@ -25880,6 +25982,12 @@ async function requestStructuredCompletion(options) {
       throw new RetrievalProviderError(
         `Provider timed out after ${config2.timeoutMs}ms. The request may still have completed and been billed.`,
         { ambiguous: true, code: "PROVIDER_TIMEOUT" }
+      );
+    }
+    if (error62 instanceof ProviderResponseProtocolError) {
+      throw new RetrievalProviderError(
+        `${error62.message} The request may still have completed and been billed.`,
+        { ambiguous: true, status: error62.status, code: error62.code }
       );
     }
     if (error62 instanceof ProviderResponseTooLargeError) {
