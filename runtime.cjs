@@ -21422,6 +21422,8 @@ var batchOverviewSchema = external_exports.object({
   batch: summaryBatchMetadataSchema,
   enabled: external_exports.boolean().default(true),
   content: external_exports.string().max(2e5),
+  // Undefined denotes legacy metadata; null records that the old text's source is unknown.
+  contentSourceHash: external_exports.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
   state: external_exports.enum(["pending", "ready", "failed"]),
   error: external_exports.string().max(2e3).optional(),
   revision: external_exports.number().int().min(1),
@@ -21506,7 +21508,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.1.10", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.1.11", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -26593,19 +26595,27 @@ function validateRule(state, previousState, rule, changedOnly = false) {
 }
 function pathCovered(path7, rules) {
   return rules.some((rule) => {
-    if (path7.length > rule.path.length && rule.type !== "object") return false;
-    return path7.slice(0, rule.path.length).every((segment, index) => rule.path[index] === "*" || rule.path[index] === segment);
+    if (!path7.slice(0, rule.path.length).every((segment, index) => rule.path[index] === "*" || rule.path[index] === segment)) return false;
+    if (path7.length <= rule.path.length || rule.type === "object") return true;
+    if (rule.type !== "array") return false;
+    const parent = path7.slice(0, rule.path.length);
+    return !rules.some((child) => child.path.length > parent.length && parent.every((segment, index) => child.path[index] === "*" || child.path[index] === segment));
   });
 }
 function validateKnownPaths(value, rules, path7 = [], previous) {
   for (const [key, child] of Object.entries(value)) {
     const childPath = [...path7, key];
-    const oldValue = previous?.[key];
+    const oldValue = Array.isArray(previous) ? previous[Number(key)] : previous?.[key];
     if (oldValue !== void 0 && canonical2(child) === canonical2(oldValue)) continue;
     if (!pathCovered(childPath, rules)) {
       throw new StatusValidationError(`Unknown status field: ${childPath.join(".")}.`);
     }
-    if (isObject3(child)) validateKnownPaths(child, rules, childPath, isObject3(oldValue) ? oldValue : void 0);
+    if (isObject3(child) || Array.isArray(child)) validateKnownPaths(
+      child,
+      rules,
+      childPath,
+      isObject3(oldValue) || Array.isArray(oldValue) ? oldValue : void 0
+    );
   }
 }
 function assertSafeValue(value, path7 = []) {
