@@ -20789,7 +20789,8 @@ var statusValidationRuleSchema = external_exports.object({
 });
 var statusValidationConfigSchema = external_exports.object({
   unknownFields: external_exports.enum(["allow", "reject"]).default("allow"),
-  rules: external_exports.array(statusValidationRuleSchema).max(500).default([])
+  rules: external_exports.array(statusValidationRuleSchema).max(500).default([]),
+  topLevelKeys: external_exports.array(external_exports.string().trim().min(1).max(200).refine((key) => !["__proto__", "prototype", "constructor"].includes(key), "Unsafe status path segment.")).min(1).max(100).optional()
 }).strict().superRefine((config2, context) => {
   const ids = config2.rules.map((rule) => rule.id);
   if (new Set(ids).size !== ids.length) {
@@ -21018,7 +21019,8 @@ var retrievalInjectionConfigSchema = external_exports.object({
   depth: external_exports.number().int().min(0).max(100).default(4),
   order: external_exports.number().int().min(-1e4).max(1e4).default(100),
   template: external_exports.string().min(1).max(1e5),
-  maxWaitMs: external_exports.number().int().min(1e3).max(5 * 6e4).default(6e4)
+  maxWaitMs: external_exports.number().int().min(1e3).max(5 * 6e4).default(6e4),
+  maxTokens: external_exports.number().int().min(0).max(1e6).optional()
 });
 var statusProfileFields = {
   name: external_exports.string().trim().min(1).max(120),
@@ -21508,7 +21510,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.1.11", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.1.12", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -26494,12 +26496,19 @@ function statusSlot(container, segment, path7, writing) {
 }
 function setAtPath(root, path7, value) {
   let cursor = root;
+  let parent;
   for (const [index, segment] of path7.entries()) {
+    if (segment === "-" && parent && isObject3(cursor) && Object.keys(cursor).length === 0) {
+      const list = [];
+      parent.set(list);
+      cursor = list;
+    }
     const slot = statusSlot(cursor, segment, path7.slice(0, index + 1), true);
     if (index === path7.length - 1) {
       slot.set(structuredClone(value));
       return;
     }
+    parent = slot;
     if (slot.value === void 0) {
       const child = {};
       slot.set(child);
@@ -26631,8 +26640,16 @@ function assertSafeValue(value, path7 = []) {
     assertSafeValue(child, [...path7, key]);
   }
 }
+function assertTopLevelKeys(state, existing, keys) {
+  const allowed = new Set(keys);
+  const added = Object.keys(state).find((key) => !allowed.has(key) && !existing.some((item) => Object.hasOwn(item, key)));
+  if (added !== void 0) {
+    throw new StatusValidationError(`\u4E0D\u5141\u8BB8\u65B0\u589E\u9876\u5C42\u5206\u7C7B\uFF1A${added}\u3002\u8BF7\u628A\u5185\u5BB9\u653E\u5165\u5DF2\u6709\u5206\u7C7B\uFF0C\u6216\u5728\u72B6\u6001\u8BBE\u7F6E\u4E2D\u8C03\u6574\u201C\u9876\u5C42\u5206\u7C7B\u201D\u3002`);
+  }
+}
 function validateStatusState(state, previousState, validation, changedOnly = false) {
   assertSafeValue(state);
+  if (validation.topLevelKeys) assertTopLevelKeys(state, [previousState], validation.topLevelKeys);
   if (validation.unknownFields === "reject") {
     validateKnownPaths(state, validation.rules, [], changedOnly ? previousState : void 0);
   }
@@ -26677,14 +26694,14 @@ var STATUS_OUTPUT_PROTOCOL = `\u53EA\u8F93\u51FA\u4E00\u4E2A JSON \u5BF9\u8C61\u
 \u5B57\u7B26\u4E32\u503C\u5185\u5982\u9700\u5F15\u7528\u6587\u5B57\uFF0C\u8BF7\u4F7F\u7528\u4E2D\u6587\u5F15\u53F7\u201C\u201D\uFF0C\u4E0D\u8981\u4F7F\u7528\u82F1\u6587\u53CC\u5F15\u53F7\uFF1B\u5B57\u7B26\u4E32\u503C\u5185\u4E0D\u8981\u76F4\u63A5\u6362\u884C\u3002
 {"operations":[{"op":"set","path":["\u5206\u7C7B","\u5B57\u6BB5"],"value":"\u65B0\u503C"},{"op":"delete","path":["\u5206\u7C7B","\u5B57\u6BB5"]}]}
 - set \u65B0\u589E\u6216\u66F4\u65B0\u4E00\u4E2A\u5B57\u6BB5\uFF0Cdelete \u5220\u9664\u4E00\u4E2A\u5B57\u6BB5\u6216\u6574\u4E2A\u4E8B\u9879\u3002
-- path \u5FC5\u987B\u6CBF\u7528\u5F53\u524D\u72B6\u6001\u7684\u5B9E\u9645\u7ED3\u6784\uFF1A\u5BF9\u8C61\u4F7F\u7528\u5B57\u6BB5\u540D\u79F0\uFF0C\u6570\u7EC4\u4F7F\u7528\u4ECE 0 \u5F00\u59CB\u7684\u4E0B\u6807\u5B57\u7B26\u4E32\uFF0C\u4F8B\u5982 ["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u672A\u89E3\u51B3\u4E8B\u9879","0"]\uFF1Bvalue \u6CBF\u7528\u76EE\u6807\u503C\u7684\u6570\u636E\u7C7B\u578B\u3002
+- path \u5FC5\u987B\u6CBF\u7528\u5F53\u524D\u72B6\u6001\u7684\u5B9E\u9645\u7ED3\u6784\uFF0C\u4ECE\u5DF2\u6709\u7684\u9876\u5C42\u5206\u7C7B\u5F00\u59CB\uFF1A\u5BF9\u8C61\u4F7F\u7528\u5B57\u6BB5\u540D\u79F0\uFF0C\u6570\u7EC4\u4F7F\u7528\u4ECE 0 \u5F00\u59CB\u7684\u4E0B\u6807\u5B57\u7B26\u4E32\uFF0C\u4F8B\u5982 ["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u672A\u89E3\u51B3\u4E8B\u9879","0"]\uFF1Bvalue \u6CBF\u7528\u76EE\u6807\u503C\u7684\u6570\u636E\u7C7B\u578B\u3002
 - \u5217\u8868\u65B0\u589E\u9879\u7528 set\uFF0Cpath \u6700\u540E\u4E00\u6BB5\u4E3A "-"\uFF1B\u4FEE\u6539\u6216\u5220\u9664\u5DF2\u6709\u9879\u4F7F\u7528\u5176\u5F53\u524D\u4E0B\u6807\uFF0C\u4E0D\u8981\u628A\u4E8B\u9879\u6B63\u6587\u5F53\u6210\u5217\u8868\u4E0B\u7684\u5BF9\u8C61\u5B57\u6BB5\u3002\u5220\u9664\u5217\u8868\u9879\u540E\uFF0C\u540E\u7EED\u4E0B\u6807\u4F1A\u524D\u79FB\uFF0C\u540E\u7EED\u64CD\u4F5C\u5FC5\u987B\u6309\u65B0\u4E0B\u6807\u6267\u884C\u3002
-- \u4E5F\u53EF\u4EE5 set \u6574\u4E2A\u5217\u8868\uFF0Cpath \u505C\u5728\u5217\u8868\u5B57\u6BB5\uFF0Cvalue \u7ED9\u51FA\u66F4\u65B0\u540E\u7684\u5B8C\u6574\u6570\u7EC4\uFF1B\u4FDD\u7559\u4ECD\u6709\u6548\u7684\u65E7\u9879\uFF0C\u4E0D\u80FD\u53EA\u4F20\u65B0\u589E\u9879\uFF0C\u5426\u5219\u4F1A\u66FF\u6362\u6574\u4E2A\u5217\u8868\u3002
+- \u4E5F\u53EF\u4EE5 set \u6574\u4E2A\u5217\u8868\uFF0Cpath \u505C\u5728\u5217\u8868\u5B57\u6BB5\uFF0Cvalue \u7ED9\u51FA\u66F4\u65B0\u540E\u7684\u5B8C\u6574\u6570\u7EC4\uFF1B\u4FDD\u7559\u4ECD\u6709\u6548\u7684\u65E7\u9879\uFF0C\u4E0D\u80FD\u53EA\u4F20\u65B0\u589E\u9879\uFF0C\u5426\u5219\u4F1A\u66FF\u6362\u6574\u4E2A\u5217\u8868\u3002\u5408\u5E76\u91CD\u590D\u9879\u65F6\u9002\u5408\u8FD9\u6837\u505A\u3002
 - \u66F4\u65B0\u5DF2\u6709\u5BF9\u8C61\u65F6\uFF0C\u4F18\u5148\u4FEE\u6539\u5176\u4E2D\u5177\u4F53\u7684\u5B50\u5B57\u6BB5\u3002set \u4E00\u4E2A\u6574\u5BF9\u8C61\u4F1A\u66FF\u6362\u539F\u6709\u5185\u5BB9\uFF0C\u6240\u4EE5\u8981\u5E26\u4E0A\u4ECD\u7136\u6709\u6548\u7684\u5B50\u5B57\u6BB5\u3002
 - \u64CD\u4F5C\u6309\u6570\u7EC4\u987A\u5E8F\u6267\u884C\u3002\u6CA1\u6709\u53D8\u5316\u65F6\u8F93\u51FA {"operations":[]}\u3002
 
 \u865A\u6784\u683C\u5F0F\u793A\u4F8B\uFF0C\u4E0D\u662F\u6545\u4E8B\u4E8B\u5B9E\uFF1A
-{"operations":[{"op":"set","path":["\u65F6\u7A7A\u72B6\u6001","\u5F53\u524D\u5730\u70B9"],"value":"\u82D4\u6E7E\u9547\u7684\u949F\u697C"},{"op":"set","path":["\u626E\u6F14\u4EBA\u7269\u72B6\u6001","\u6E29\u781A","\u8EAB\u4F53\u72B6\u6001"],"value":"\u5DE6\u624B\u64E6\u4F24\uFF0C\u5DF2\u5305\u624E"},{"op":"delete","path":["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u5DF2\u63A5\u53D7\u4EFB\u52A1\u6216\u7EA6\u5B9A","\u5F52\u8FD8\u7F57\u76D8"]}]}
+{"operations":[{"op":"set","path":["\u65F6\u7A7A\u72B6\u6001","\u5F53\u524D\u5730\u70B9"],"value":"\u82D4\u6E7E\u9547\u7684\u949F\u697C"},{"op":"set","path":["\u626E\u6F14\u4EBA\u7269\u72B6\u6001","\u6E29\u781A","\u8EAB\u4F53\u72B6\u51B5"],"value":"\u5DE6\u624B\u64E6\u4F24\uFF0C\u5DF2\u5305\u624E"},{"op":"delete","path":["\u626E\u6F14\u4EBA\u7269\u72B6\u6001","\u6E29\u781A","\u4E34\u65F6\u9650\u5236"]}]}
 \u82E5\u5F53\u524D\u201C\u672A\u89E3\u51B3\u4E8B\u9879\u201D\u4E3A ["\u6253\u542C\u6E21\u8239\u73ED\u6B21","\u5F52\u8FD8\u7F57\u76D8"]\uFF0C\u5B8C\u6210\u7B2C\u4E8C\u9879\u5E76\u65B0\u589E\u4E00\u9879\u53EF\u8F93\u51FA\uFF1A
 {"operations":[{"op":"delete","path":["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u672A\u89E3\u51B3\u4E8B\u9879","1"]},{"op":"set","path":["\u8BA1\u5212\u4E0E\u627F\u8BFA","\u672A\u89E3\u51B3\u4E8B\u9879","-"],"value":"\u9886\u53D6\u4FEE\u590D\u597D\u7684\u80CC\u5305"}]}`;
 function statusValidationNote(validation) {
