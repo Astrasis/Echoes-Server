@@ -21556,7 +21556,7 @@ var TaskBudget = class {
 };
 
 // src/shared/build-info.ts
-var ECHOES_BUILD_INFO = { appVersion: "4.1.13", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
+var ECHOES_BUILD_INFO = { appVersion: "4.2.0", apiProtocolVersion: API_PROTOCOL_VERSION, service: "echoes-memory" };
 var ECHOES_SERVER_BUILD_INFO = ECHOES_BUILD_INFO;
 function protocolCompatible(value) {
   return value === void 0 || value === API_PROTOCOL_VERSION;
@@ -21660,6 +21660,13 @@ function registerRoutes(options) {
       ...parsedLimit === void 0 || Number.isNaN(parsedLimit) ? {} : { limit: parsedLimit }
     };
   };
+  router.post("/maintenance/chat-reset", route(async (request, response) => {
+    const input2 = external_exports.object({ chatId: external_exports.string().min(1).max(512), confirmed: external_exports.literal(true) }).strict().parse(request.body);
+    const runtime = await runtimes2.forRequest(request);
+    const service = retrieval(runtime);
+    const job = await runtime.jobs.create("chat-data-reset", (context) => service.clearChatDocuments(input2.chatId, context.signal));
+    response.status(202).json({ job });
+  }));
   router.get("/health", (_request, response) => {
     response.json({ ok: true, build: ECHOES_SERVER_BUILD_INFO });
   });
@@ -23270,6 +23277,9 @@ var RetrievalService = class {
   deleteCollection(collectionId) {
     return this.store.deleteCollection(collectionId);
   }
+  clearChatDocuments(chatId, signal) {
+    return this.store.clearChatDocuments(chatId, signal);
+  }
   deleteDocuments(documentIds) {
     return this.store.deleteDocuments(documentIds);
   }
@@ -24233,6 +24243,41 @@ var RetrievalStore = class {
       await table.delete(inFilter("document_id", documentIds));
       await this.deleteVectors(documentIds);
       return existing.length;
+    });
+  }
+  /** Raw ownership scan also works when a document body/tags or an old schema is unreadable. */
+  async clearChatDocuments(chatId, signal) {
+    return this.serialize(async () => {
+      const table = await this.documentsTable();
+      let after = "";
+      let deletedDocuments = 0;
+      let skippedCorruptDocuments = 0;
+      while (true) {
+        signal?.throwIfAborted();
+        const rows = await table.query().select(["document_id", "metadata_json"]).where(`source_type = 'chat_summary'${after ? ` AND document_id > ${sqlString(after)}` : ""}`).orderBy({ columnName: "document_id", ascending: true }).limit(500).toArray();
+        if (!rows.length) break;
+        const ids = [];
+        for (const row of rows) {
+          try {
+            const metadata = JSON.parse(String(row.metadata_json));
+            if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+              skippedCorruptDocuments += 1;
+              continue;
+            }
+            if (metadata.chatId === chatId) ids.push(String(row.document_id));
+          } catch {
+            skippedCorruptDocuments += 1;
+          }
+        }
+        signal?.throwIfAborted();
+        if (ids.length) {
+          await this.deleteVectors(ids);
+          await table.delete(inFilter("document_id", ids));
+          deletedDocuments += ids.length;
+        }
+        after = String(rows.at(-1).document_id);
+      }
+      return { deletedDocuments, skippedCorruptDocuments };
     });
   }
   async collectionStats(collection) {
